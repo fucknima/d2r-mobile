@@ -699,7 +699,8 @@ static int state_read_item(uint64_t u, state_item *it, size_t ord, uint64_t *nex
     return 1;
 }
 enum { CLS_TBK = 533, CLS_TSC = 544 };   // 回城书 / 回城卷轴（原版 misc.txt 行序 + 武器 306 + 护甲 217，跳过 Expansion 分隔行；与手机存档 tsc=544 对上） | Tome of Town Portal / Scroll of Town Portal (the original game's misc.txt row order + weapons 306 + armor 217, skipping the Expansion separator row; matches tsc=544 in the phone save)
-static uint64_t g_player_unit;   // 最近一拍找到的受控玩家单位（0 = 没读到） | Controlled player unit found on the most recent tick (0 = not read)
+static uint64_t g_player_unit;   /* 最近一拍找到的受控玩家单位（0 = 没读到） | Controlled player unit found on the most recent tick (0 = not read) */
+uint64_t dm_cheats_player(void) { return g_player_unit; }   // 给 dm_cheats.c 复用，省一次全表扫描 | reused by dm_cheats.c to save a full table scan | Controlled player unit found on the most recent tick (0 = not read)
 // 测试开关 DM_TEST_WORLD_SEEK（造现场用，客户端一侧在 dm_world.c w_test_seek_step）的服务端一半：探路不走路，用游戏服务端自己的传送 main+0x7cc530(游戏, 单位, 房间, x, y, 0, 0)
 // ——传送技能、传送阵、任务挪人都调它（D2MOO sub_6FCBDFE0）：房间给 0 时它在单位当前房间与相邻房间里按坐标找，在落点旁找空位，给客户端发重定位包。
 // 所以一次只能跳到相邻房间：按关卡房间的矩形贴边关系做广度优先，朝「没去过的房间」一间一间跳；门、怪、墙都不挡。人进了一间房，相邻房间就会载入，要找的物件随之出现。
@@ -1790,7 +1791,7 @@ static void freeze_tick(uint64_t G) {   // 拍入口：定这一拍冻不冻，�
     else if (!want && frozen) { int nm = 0, hp = 0; uint32_t h = frz_snapshot(G, &nm, &hp); atomic_store(&g_dm_frozen, 0); frozen = 0; if (mtl_world_frozen) mtl_world_frozen(0); LOG("面板冻结：拍 %u 解冻（冻了 %u 次拍入口）；怪 %d 只 校验 %08x 玩家生命 %d", t, calls, nm, h, hp); }
     if (frozen) { calls++; uint32_t t1 = t - 1; memcpy((void *)(uintptr_t)(G + 0x170), &t1, 4); }
 }
-static void tick_gate_product(const uint64_t *regs) { g_lastG = regs[0]; players_apply(); hud_tick(regs[0]); freeze_tick(regs[0]); }   // 产品缺省的拍入口：只落地难度档、发布 HUD 数字 | The product default tick entry: only applies the difficulty level and publishes the HUD numbers
+static void tick_gate_product(const uint64_t *regs) { g_lastG = regs[0]; players_apply(); hud_tick(regs[0]); { void dm_cheats_tick(uint64_t); dm_cheats_tick(regs[0]); } freeze_tick(regs[0]); }   // 产品缺省的拍入口：只落地难度档、发布 HUD 数字 | The product default tick entry: only applies the difficulty level and publishes the HUD numbers
 static void tick_gate(const uint64_t *regs) {         // 拍入口：先注入本拍命令包，再取状态哈希 | Tick entry: first inject this tick's command packets, then take the state hash
     {   // 拍入口只在一条客体线程上跑：state_dump / ticks_hash 的 static 缓冲靠这一点不竞争。换线程即中止，别让输出悄悄写乱 | The tick entry runs on only one guest thread: the static buffers of state_dump / ticks_hash rely on this to be race-free. Abort if the thread changes, do not let the output silently get garbled
         static _Atomic uintptr_t owner; uintptr_t me = (uintptr_t)pthread_self(), exp = 0;
@@ -1799,6 +1800,7 @@ static void tick_gate(const uint64_t *regs) {         // 拍入口：先注入�
     g_lastG = regs[0];
     players_apply();
     hud_tick(regs[0]);
+    { void dm_cheats_tick(uint64_t); dm_cheats_tick(regs[0]); }
     crash_watch_progress(cur_tick(), "拍入口");
     if (getenv("DM_TEST_LEAK")) {
         static void **leaks; static size_t nleaks;

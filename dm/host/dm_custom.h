@@ -5,6 +5,10 @@
 // 已生效的值 0 / 1：只在玩家点选项页「应用」后变，「放弃」不变，「默认」= 各键缺省（省电模式关，其余开）。键不认识返回 1。
 // 任意线程可调：第一次调用读一次文件，之后只是原子量读 + 几项字符串比较，无锁。iOS 上启动期（存档挂上之前）就能读。
 // 键：auto_mana 自动喝药水（红蓝两种，键名沿用）/ drop_light 高价值掉落光柱 / map_mark 小地图标注出入口、小站与任务终点 / item_notes 物品注释与旧译名 / icloud iCloud 同步存档（cloud_ios.m，启动时读）/ pot_pick 药水自动拾取（dm_potpick.c）/ drop_haptic 高价值掉落震动（dm_drophaptic.c） / gem_pick 符文宝石自动拾取进高级仓库（百宝囊）/ store_btn 背包「存放」按钮（dm_pouch.c）/ eco_fps 省电模式 30 帧（nvn_mtl.m，缺省关）
+// 单机增强（dm_cheats.c，服务端拍入口写客体）：god_mode 无限血蓝耐力 / heal_full 一键满（点头一次，执行后自动归零）/ attr_max 属性拉满 /
+// stat_points 无限属性点 / skill_points 无限技能点 / resist_max 抗性拉满 / regen_fast 快速回血 / durability 装备无限耐久 / gold 无限金币 /
+// xp_mult 经验倍率（0..5 = 1×/2×/5×/10×/50×/100×）/ drop_mult 掉落稀有率（同上，改品质比例表、退局还原）
+// Single-player enhancements (dm_cheats.c, written to the guest at the server tick entry): see the key list above; heal_full is a one-shot that resets itself to 0 after it runs.
 // touch_swap_above：0 = 传送门左侧（默认），1 = 技能区上方；点「应用」后生效。
 // Effective value 0 / 1: changes only after the player taps Apply on the options page; Discard leaves it unchanged; Default = each key's default (power-saving mode off, the rest on). Returns 1 for an unknown key.
 // Callable from any thread: the first call reads the file once, after that it is an atomic read plus a few string comparisons, lock-free. On iOS it can be read during startup (before the save is mounted).

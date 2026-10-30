@@ -1179,7 +1179,9 @@ def _drop_rows(*rows):
 # 视频页的表格整个换成我们的行：分节标题 + 每个开关一行原版勾选框（照「游戏」页「自动拾取金币」那一行的字段）。控件名 TouchCustom_<键>，
 # 宿主 dm_custom.c 读勾没勾、按应用 / 放弃 / 默认处理。勾选框的消息发一条无害的 ClosePanel（同「极乐世界」），游戏不认
 # 「配音」单选（voice：中文配音 / English voice）只在编进过场解码的包里有（MOVIE_FFMPEG=1，与宿主 dm_custom.c 的 DM_MOVIE_FFMPEG 同一个开关）：缺省包的自定义页一行不多
-_CUSTOM_KEYS = (('voice',) if os.environ.get('MOVIE_FFMPEG') == '1' else ()) + ('auto_mana', 'merc_pot', 'drop_light', 'map_mark', 'item_notes', 'icloud', 'pot_pick', 'drop_haptic', 'gem_pick', 'store_btn', 'eco_fps', 'q3d', 'loot_filter', 'auto_buff', 'touch_swap_above', 'cam')
+_CUSTOM_KEYS = (('voice',) if os.environ.get('MOVIE_FFMPEG') == '1' else ()) + ('auto_mana', 'merc_pot', 'drop_light', 'map_mark', 'item_notes', 'icloud', 'pot_pick', 'drop_haptic', 'gem_pick', 'store_btn', 'eco_fps', 'q3d', 'loot_filter', 'auto_buff', 'touch_swap_above', 'cam',
+                 'god_mode', 'heal_full', 'attr_max', 'stat_points', 'skill_points', 'resist_max', 'regen_fast',
+                 'durability', 'gold', 'xp_mult', 'drop_mult')
 # 字在中英表（dm/i18n/ui_text.tsv 的 dmCustom<键名驼峰>），布局写 @键、跟原版语言走（英文版）；行高按中文行数分，英文必须同样行数（不然换语言排版变）
 # The text lives in the Chinese-English string table (dmCustom<key name in camel case> in dm/i18n/ui_text.tsv); layouts write @key and follow the
 # original game's language (English version); row height is assigned by the number of Chinese lines, and English must have the same number of lines
@@ -1277,6 +1279,29 @@ def _custom_q3d_row(i, setting="q3d"):
 # description text below its title, three rows high. Checkboxes TouchCustom_cam (original) / _ots / _fp; the host's dm_custom.c makes the three mutually
 # exclusive (like the language row) and stores one key cam; TouchCustom_cam_Text is empty and covers all three, for the controller selection frame (like 3D quality)
 _CAM_OPTS = (('dmCustomCamOff', 'TouchCustom_cam'), ('dmCustomCamOts', 'TouchCustom_cam_ots'), ('dmCustomCamFp', 'TouchCustom_cam_fp'))
+# 倍率两行（xp_mult / drop_mult）：六项单选并排「1× 2× 5× 10× 50× 100×」，勾选框 TouchCustom_<键>_<档>，宿主 dm_custom.c 让六框互斥、存第几档；
+# 宿主 dm_custom.c 的 radio_pump 只认「勾选框 + 自带的 _Text 文字框」这一套（手柄选中框按两者的上下沿取并），所以左边仍写一行标签
+# The two multiplier rows (xp_mult / drop_mult): six side-by-side options 1x 2x 5x 10x 50x 100x, checkboxes TouchCustom_<key>_<step>;
+# the host's dm_custom.c makes the six mutually exclusive and stores the step index. radio_pump expects a checkbox plus its own _Text box
+# (the controller selection frame takes the union of both), so the label stays on the left
+_STEP_OPTS = (('1', 'dmCustomMult1'), ('2', 'dmCustomMult2'), ('5', 'dmCustomMult5'),
+              ('10', 'dmCustomMult10'), ('50', 'dmCustomMult50'), ('100', 'dmCustomMult100'))
+def _custom_steps_row(i, key, label):
+    y, h = _CUSTOM_Y[i], _CUSTOM_LINE_H
+    box = ('        {{ "type": "ToggleButtonWidget", "name": "TouchCustom_{key}_{suf}", "fields": {{\n'
+           '            "rect": {{ "x": {x}, "y": {by}, "width": 70, "height": 70 }}, "sound": "cursor_menu_select_hd",\n'
+           '            "focusIndicatorPadding": "$OptionsToggleFocusIndicatorPadding", "focusIndicatorFilename": "$OptionsToggleFocusIndicatorFilename", "focusIndicatorOffset": {{ "x": 0, "y": -4 }},\n'
+           '            "filename": "Lobby\\\\CreateGame\\\\CreateGame_AdvancedCheckbox",\n'
+           '            "untoggledFrame": 0, "untoggledPressedFrame": 1, "untoggledHoveredFrame": 3, "untoggledDisabledFrame": 2,\n'
+           '            "toggledFrame": 4, "toggledPressedFrame": 5, "toggledHoveredFrame": 6,\n'
+           '            "onClickMessage": "PanelManager:ClosePanel:TouchCustom_{key}_{suf}" }} }},\n'
+           '        {{ "type": "TextBoxWidget", "name": "TouchCustom{key}_{suf}_Text", "fields": {{ "rect": {{ "x": {tx}, "y": {y}, "width": 40, "height": {h} }}, "text": "@{txt}", "style": "$StyleSettingsText" }} }},\n')
+    out = ('        {{ "type": "TextBoxWidget", "name": "TouchCustom_{key}_Text", "fields": {{ "rect": {{ "x": 0, "y": {y}, "width": 700, "height": {h} }}, "text": "{label}", "style": "$StyleSettingsText" }} }},\n'
+           .format(key=key, y=y, h=h, label=label))
+    for k, (suf, txt) in enumerate(_STEP_OPTS):
+        x = 700 + k * 115
+        out += box.format(key=key, suf=suf, x=x, by=y + (h - 70) // 2, tx=x + 78, y=y, h=h, txt=txt)
+    return out
 def _custom_page(text):
     if '"name": "VideoOptionsPanel"' not in text or '"name": "OptionsTable"' not in text: raise SystemExit('touch_layout：主机版视频页不是原样（原版布局变了？），自定义页没换')
     title = ('{ "type": "TableRowWidget", "name": "Row TouchCustomTitle", "children": [\n'
@@ -1290,7 +1315,7 @@ def _custom_page(text):
            '            { "type": "TableWidget", "name": "OptionsTable", "fields": { "columns": [ "$OptionsTableColumn1", "$OptionsTableColumn2" ], "rowHeight": %d }, "children": [\n' % _CUSTOM_TITLE_H
            + title + '            ] },\n'
            + '            { "type": "Widget", "name": "TouchCustomRows", "fields": { "rect": { "x": 0, "y": 0, "width": 1500, "height": %d } }, "children": [\n' % _CUSTOM_H
-           + _custom_lang_row() + ''.join((_custom_q3d_row(i, k) if k in ('voice', 'q3d', 'touch_swap_above', 'cam') else _custom_toggle_row(i, k, l)) for i, (k, l) in enumerate(_CUSTOM_ALL) if i) + _CUSTOM_LANG_HINT
+           + _custom_lang_row() + ''.join((_custom_steps_row(i, k, l) if k in ('xp_mult', 'drop_mult') else _custom_q3d_row(i, k) if k in ('voice', 'q3d', 'touch_swap_above', 'cam') else _custom_toggle_row(i, k, l)) for i, (k, l) in enumerate(_CUSTOM_ALL) if i) + _CUSTOM_LANG_HINT
            + ''.join('        { "type": "TextBoxWidget", "name": "TouchCustomTest%d_Text", "fields": { "rect": { "x": 0, "y": %d, "width": 1000, "height": %d }, "text": "@KeyBindingTypeCustom", "style": "$StyleSettingsText" } },\n'
                      % (n, _CUSTOM_Y[len(_CUSTOM_ALL) + n], _CUSTOM_LINE_H) for n in range(_CUSTOM_TEST_ROWS)) +
            # 手柄模式的选中框（同符文之语清单 TouchRwSel）：框住十字键选中的那一行，宿主摆（dm_custom.c）；触屏模式一直在屏外（只把 x 挪出去、y 留在内容范围内：滚动区按子控件的范围算内容高度，y 放到 99999 会把可滚范围撑到十万）。和各行在同一个容器里，跟着滚
