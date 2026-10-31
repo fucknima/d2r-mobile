@@ -476,3 +476,4 @@ dmCustomMult5	5×	5x	5×		5×	5×	倍率档位
 dmCustomMult10	10×	10x	10×		10×	10×	倍率档位
 dmCustomMult50	50×	50x	50×		50×	50×	倍率档位
 dmCustomMult100	100×	100x	100×		100×	100×	倍率档位
+dmTcRefill	满血	Refill	Rellenar		Восполнить	만피	主界面满血钮（DmTouchOverlay）

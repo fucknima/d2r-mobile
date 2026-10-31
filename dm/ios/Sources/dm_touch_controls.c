@@ -79,6 +79,7 @@ void dm_tc_layout_make(dm_tc_layout *l, float width, float height) {
     l->diff = (dm_tc_target){l->width/2+(1090-1434)*u, 1241.5f*u, 57*u, 0};
     for (int i = 0; i < 8; ++i) l->pick[i] = (dm_tc_target){l->width/2+(1390+(i-3.5f)*120-1434)*u, 1051.5f*u, 57*u, 0};
     l->target[DM_TC_MAP] = (dm_tc_target){l->width-30*k, 30*k, 22*k, DM_BTN_MINUS};
+    l->target[DM_TC_REFILL] = (dm_tc_target){l->width-82*k, 30*k, 22*k, 0};   // 满血钮：地图左边一格，不出按键（点下由宿主 dm_cheats_pulse 补满） | refill button: one slot left of the map, emits no key (host dm_cheats_pulse fills on tap)
     // 默认换组键沿传送门外弧向左排布，保持到主技能的半径不变。
     // Default: continue the portal's outer arc to its left, preserving the radius around the primary.
     const dm_tc_target *portal=&l->target[DM_TC_PORTAL];

@@ -5,14 +5,14 @@
 extern "C" {
 #endif
 
-enum { DM_TC_MAX_TOUCH = 16, DM_TC_COUNT = 12 };
+enum { DM_TC_MAX_TOUCH = 16, DM_TC_COUNT = 13 };
 enum {
     DM_TC_NONE = -1, DM_TC_JOYSTICK = -2, DM_TC_SWAP = -3, DM_TC_DIFF = -4,   /* DIFF：难度格 / 选择条占用的手指，不发按键 | DIFF: a finger captured by the difficulty cell / selector bar; sends no key */
     DM_TC_EDGE = -5,   /* 屏幕底边归系统的那一条里起手的手指：不当摇杆，松手也不当点地 | A finger that started in the strip along the bottom edge of the screen that belongs to the system: not treated as the stick, and its release is not treated as a ground tap */
     DM_TC_MAIN = 0,
     DM_TC_SKILL1, DM_TC_SKILL2, DM_TC_SKILL3, DM_TC_SKILL4,
     DM_TC_PORTAL, DM_TC_BELT1, DM_TC_BELT2, DM_TC_BELT3, DM_TC_BELT4,
-    DM_TC_MENU, DM_TC_MAP
+    DM_TC_MENU, DM_TC_MAP, DM_TC_REFILL
 };
 typedef struct { float x, y, r; uint64_t button; } dm_tc_target;
 typedef struct {

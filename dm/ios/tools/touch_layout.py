@@ -1288,19 +1288,20 @@ _STEP_OPTS = (('1', 'dmCustomMult1'), ('2', 'dmCustomMult2'), ('5', 'dmCustomMul
               ('10', 'dmCustomMult10'), ('50', 'dmCustomMult50'), ('100', 'dmCustomMult100'))
 def _custom_steps_row(i, key, label):
     y, h = _CUSTOM_Y[i], _CUSTOM_LINE_H
-    box = ('        {{ "type": "ToggleButtonWidget", "name": "TouchCustom_{key}_{suf}", "fields": {{\n'
-           '            "rect": {{ "x": {x}, "y": {by}, "width": 70, "height": 70 }}, "sound": "cursor_menu_select_hd",\n'
-           '            "focusIndicatorPadding": "$OptionsToggleFocusIndicatorPadding", "focusIndicatorFilename": "$OptionsToggleFocusIndicatorFilename", "focusIndicatorOffset": {{ "x": 0, "y": -4 }},\n'
-           '            "filename": "Lobby\\\\CreateGame\\\\CreateGame_AdvancedCheckbox",\n'
-           '            "untoggledFrame": 0, "untoggledPressedFrame": 1, "untoggledHoveredFrame": 3, "untoggledDisabledFrame": 2,\n'
-           '            "toggledFrame": 4, "toggledPressedFrame": 5, "toggledHoveredFrame": 6,\n'
-           '            "onClickMessage": "PanelManager:ClosePanel:TouchCustom_{key}_{suf}" }} }},\n'
-           '        {{ "type": "TextBoxWidget", "name": "TouchCustom{key}_{suf}_Text", "fields": {{ "rect": {{ "x": {tx}, "y": {y}, "width": 40, "height": {h} }}, "text": "@{txt}", "style": "$StyleSettingsText" }} }},\n')
-    out = ('        {{ "type": "TextBoxWidget", "name": "TouchCustom_{key}_Text", "fields": {{ "rect": {{ "x": 0, "y": {y}, "width": 700, "height": {h} }}, "text": "{label}", "style": "$StyleSettingsText" }} }},\n'
+    small = '{ "fontColor": "$FontColorGray", "pointSize": 30, "alignment": { "h": "left", "v": "center" } }'
+    out = ('        {{ "type": "TextBoxWidget", "name": "TouchCustom_{key}_Text", "fields": {{ "rect": {{ "x": 0, "y": {y}, "width": 420, "height": {h} }}, "text": "{label}", "style": "$StyleSettingsText" }} }},\n'
            .format(key=key, y=y, h=h, label=label))
     for k, (suf, txt) in enumerate(_STEP_OPTS):
-        x = 700 + k * 115
-        out += box.format(key=key, suf=suf, x=x, by=y + (h - 70) // 2, tx=x + 78, y=y, h=h, txt=txt)
+        x = 430 + k * 150
+        out += ('        {{ "type": "ToggleButtonWidget", "name": "TouchCustom_{key}_{suf}", "fields": {{\n'
+                '            "rect": {{ "x": {x}, "y": {by}, "width": 70, "height": 70 }}, "sound": "cursor_menu_select_hd",\n'
+                '            "focusIndicatorPadding": "$OptionsToggleFocusIndicatorPadding", "focusIndicatorFilename": "$OptionsToggleFocusIndicatorFilename", "focusIndicatorOffset": {{ "x": 0, "y": -4 }},\n'
+                '            "filename": "Lobby\\\\CreateGame\\\\CreateGame_AdvancedCheckbox",\n'
+                '            "untoggledFrame": 0, "untoggledPressedFrame": 1, "untoggledHoveredFrame": 3, "untoggledDisabledFrame": 2,\n'
+                '            "toggledFrame": 4, "toggledPressedFrame": 5, "toggledHoveredFrame": 6,\n'
+                '            "onClickMessage": "PanelManager:ClosePanel:TouchCustom_{key}_{suf}" }} }},\n'
+                '        {{ "type": "TextBoxWidget", "name": "TouchCustom{key}_{suf}_Text", "fields": {{ "rect": {{ "x": {tx}, "y": {y}, "width": 70, "height": {h} }}, "text": "@{txt}", "style": {small} }} }},\n'
+                .format(key=key, suf=suf, x=x, by=y + (h - 70) // 2, tx=x + 74, y=y, h=h, txt=txt, small=small))
     return out
 def _custom_page(text):
     if '"name": "VideoOptionsPanel"' not in text or '"name": "OptionsTable"' not in text: raise SystemExit('touch_layout：主机版视频页不是原样（原版布局变了？），自定义页没换')

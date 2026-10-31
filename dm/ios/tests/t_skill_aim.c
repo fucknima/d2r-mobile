@@ -54,7 +54,7 @@ int main(void) {
     begin(&s,0,DM_TC_MAIN); drag(&s,0,DM_TC_MAIN,15,-15); CHECK(s.rx==16384 && s.ry==16384);
     dm_tc_enable_targets(&s,0); CHECK(s.rx==0 && s.ry==0 && s.buttons==0);
     dm_tc_enable_targets(&s,(1u<<DM_TC_COUNT)-1);
-    const int non_skill[]={DM_TC_PORTAL,DM_TC_BELT1,DM_TC_MENU,DM_TC_MAP};
+    const int non_skill[]={DM_TC_PORTAL,DM_TC_BELT1,DM_TC_MENU,DM_TC_MAP,DM_TC_REFILL};
     for(unsigned i=0;i<sizeof(non_skill)/sizeof(*non_skill);i++) {
         begin(&s,0,non_skill[i]); drag(&s,0,non_skill[i],30,-30); CHECK(s.rx==0 && s.ry==0 && s.aim_slot==DM_TC_NONE); dm_tc_end(&s,0);
     }

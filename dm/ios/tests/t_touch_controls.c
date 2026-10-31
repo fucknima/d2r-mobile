@@ -11,7 +11,8 @@ static int checks, cases;
 
 static const uint64_t keys[DM_TC_COUNT] = {
     DM_BTN_A, DM_BTN_B, DM_BTN_X, DM_BTN_Y, DM_BTN_R, 0,   /* 回城钮不出按键：点下由宿主施放回城 | The town portal button emits no key: on tap the host casts town portal */
-    DM_BTN_LEFT, DM_BTN_UP, DM_BTN_DOWN, DM_BTN_RIGHT, DM_BTN_PLUS, DM_BTN_MINUS
+    DM_BTN_LEFT, DM_BTN_UP, DM_BTN_DOWN, DM_BTN_RIGHT, DM_BTN_PLUS, DM_BTN_MINUS,
+    0   /* 满血钮同样不出按键 | the refill button emits no key either */
 };
 static void press(dm_tc_state *s, int slot, int target) {
     dm_tc_target t = s->layout.target[target];
