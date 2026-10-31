@@ -79,13 +79,21 @@ void dm_tc_layout_make(dm_tc_layout *l, float width, float height) {
     l->diff = (dm_tc_target){l->width/2+(1090-1434)*u, 1241.5f*u, 57*u, 0};
     for (int i = 0; i < 8; ++i) l->pick[i] = (dm_tc_target){l->width/2+(1390+(i-3.5f)*120-1434)*u, 1051.5f*u, 57*u, 0};
     l->target[DM_TC_MAP] = (dm_tc_target){l->width-30*k, 30*k, 22*k, DM_BTN_MINUS};
-    l->target[DM_TC_REFILL] = (dm_tc_target){l->width-82*k, 30*k, 22*k, 0};   // 满血钮：地图左边一格，不出按键（点下由宿主 dm_cheats_pulse 补满） | refill button: one slot left of the map, emits no key (host dm_cheats_pulse fills on tap)
+
     // 默认换组键沿传送门外弧向左排布，保持到主技能的半径不变。
     // Default: continue the portal's outer arc to its left, preserving the radius around the primary.
     const dm_tc_target *portal=&l->target[DM_TC_PORTAL];
     float px=portal->x-main_x,py=portal->y-main_y,cs=cosf(.46f),sn=sinf(.46f);
     l->swap=(dm_tc_target){main_x+px*cs+py*sn,main_y-px*sn+py*cs,22*k,0};
     if (g_swap_above) l->swap=(dm_tc_target){main_x-124*k,main_y-114*k,22*k,0};
+    /* 满血钮：接在换组键（技能换页）外侧的同一条弧上，再转一步——换组键在弧上的前一位。
+       平板「换组在上」那档没有弧可接，直接放在换组键左边一格。
+       Refill button: one more step along the same arc outside the skill-set switch (so it sits just before it on the arc).
+       With the tablet "switch above" profile there is no arc to continue, so place it one slot left of the switch. */
+    { const dm_tc_target *sw=&l->swap;
+      if (g_swap_above) l->target[DM_TC_REFILL]=(dm_tc_target){sw->x-52*k,sw->y,22*k,0};
+      else { float rx=sw->x-main_x, ry=sw->y-main_y;
+             l->target[DM_TC_REFILL]=(dm_tc_target){main_x+rx*cs+ry*sn, main_y-rx*sn+ry*cs, 22*k, 0}; } }
     /* 底栏外侧是血 / 蓝球；球不是输入目标。 | Outside the bottom bar are the life / mana orbs; the orbs are not input targets. */
     /* 左摇杆是浮动底盘：左下「起摇杆区」里手指落在哪，底盘圆心就落在哪，松手回静止位。
        静止位：圆心离安全区左界 90（底盘半径 60 + 30）、不小于 120，离屏幕底 115——只是没按时画在哪。
