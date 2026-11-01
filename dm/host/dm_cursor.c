@@ -697,9 +697,13 @@ static int bd_skill_walk(uint64_t w, uint64_t xy, int dep) {
     return 0;
 }
 // 属性页的四个「+」（CharacterStatsPanel > LevelUpInfo > Strength / Dex / Vitality / EnergyPointButton）：点一下游戏当场加 1 点、不可撤销。
-// 「先选中、再确认」：技能图标与这四个「+」的点按只移光标（选中、出说明），加点由手机层的确认按钮触发。第 62 位 = 命中的是属性「+」。
+// 「先选中、再确认」：技能图标与这四个「+」点一下只移光标（选中、出说明），再点同一个才加点（属性当场加 1，技能稍后由 dm_skill_add_selected 加）；
+// 按住「+」不放 = 连续加点。前端各自接（Android touch_android.c、iOS front_ios.m）；面板态的五个圆钮缺省不出（DM_TOUCH_NAV_PAD），没有单独的确认钮。第 62 位 = 命中的是属性「+」。
 // The four "+" on the attributes page (CharacterStatsPanel > LevelUpInfo > Strength / Dex / Vitality / EnergyPointButton): one tap and the game adds 1 point on the spot, irreversibly.
-// "Select first, then confirm": taps on skill icons and these four "+" only move the cursor (select, show the tooltip), and spending the point is triggered by the phone layer's confirm button. Bit 62 = the hit is an attribute "+".
+// "Select first, then confirm": one tap on a skill icon or one of these four "+" only moves the cursor (select, show the tooltip), and tapping the same one again
+// spends the point (attributes add 1 on the spot, skills shortly after through dm_skill_add_selected); holding a "+" spends continuously. Each front end wires
+// this (Android touch_android.c, iOS front_ios.m); the five round buttons of the panel state are off by default (DM_TOUCH_NAV_PAD), so there is no separate
+// confirm button. Bit 62 = the hit is an attribute "+".
 static _Atomic uint32_t g_bd_hit_id;   // 最近一次命中的加点类按钮是哪一个（g_bd_hit_ref = 它的控件，主线程写） | Which point-allocation button was hit most recently (g_bd_hit_ref = its widget, written by the main thread)
 uint32_t dm_ui_hit_id(void) { return atomic_load(&g_bd_hit_id); }
 static int bd_stat_walk(uint64_t w, uint64_t xy, int dep) {
@@ -1652,18 +1656,27 @@ static uint64_t ui_find(uint64_t w, const char *name, int dep);
 // ---------- 技能绑定的触摸流程 ----------
 // 原版手柄流程：技能树（SkillsTreePanel）里光标停在一个技能上按 Y → 弹「重新绑定技能」框（ButtonBindingModal，两排六格 A B Y X R ZR，第二排 = 按住 ZL 的那组）；
 // 在框里「直接按要绑的那个键」就绑上并关框（不是移光标选格：按方向键没反应，按 A 即绑到 A 位）。
-// 触摸流程把顺序反过来——先定位（点空技能位的十字 / 长按技能钮），再选技能：
-//   1 开技能树：按 +（功能页）后看 SkillsTreePanel 开没开，没开就按 R 翻页，直到它开（最多 8 次）；
-//   2 等玩家点技能：前端把这期间的点按改成「手柄光标走到触点 + 按 Y」；看到 ButtonBindingModal 开了进下一步；玩家自己关了技能树 = 取消；
-//   3 框开稳后按目标键（第二组带 ZL），等框关；再按 B 关功能页回到游戏。
+// 触摸有两个入口（Android touch_android.c、iOS front_ios.m 各自接，做法相同）：
+//   甲 先选位：点空技能位的十字（dm_ui_bind_begin），宿主替玩家走下面三步：
+//     1 开技能树：按 +（功能页）后看 SkillsTreePanel 开没开，没开就按 R 翻页，直到它开（最多 8 次）；
+//     2 等玩家点技能：前端把这期间的点按改成「手柄光标走到触点 + 按 Y」；看到 ButtonBindingModal 开了进下一步；玩家自己关了技能树 = 取消；
+//     3 框开稳后按目标键（第二组带 ZL），等框关；再按 B 关功能页回到游戏。
+//   乙 先选技能（已有技能的键只能这样换）：技能树里按住一个技能图标不动满 0.5 秒，前端把光标移到图标上按 Y，游戏弹自己的绑定框；
+//     玩家点框里的格子 = 替玩家按那一格的键（ui_bind_modal_tap），绑完不关功能页（g_bd_stay）。
+// 按住局内的技能钮不是换绑，是持续施放（早先的「长按技能钮换绑」已去掉）。
 // 面板开没开看控件树（名字 + 可见位），每 6 帧看一次；每步有帧数上限，超时放弃并打日志。
 // ---------- Touch flow for skill binding ----------
 // The original game's controller flow: in the skill tree (SkillsTreePanel), with the cursor on a skill, press Y → the 「重新绑定技能」(Press button to rebind skill) box pops up (ButtonBindingModal, two rows of six cells A B Y X R ZR, second row = the set with ZL held);
 // in the box, "directly pressing the key to bind" binds it and closes the box (it is not moving a cursor to pick a cell: the D-pad does nothing, and pressing A binds to the A slot).
-// The touch flow reverses the order - pick the slot first (tap the cross on an empty skill slot / long-press a skill button), then pick the skill:
-//   1 Open the skill tree: after pressing + (function page), check whether SkillsTreePanel is open; if not, press R to flip pages until it is (at most 8 times);
-//   2 Wait for the player to tap a skill: the front end turns taps during this time into "move the controller cursor to the touch point + press Y"; once ButtonBindingModal is seen open, go to the next step; the player closing the skill tree themselves = cancel;
-//   3 Once the box has opened and settled, press the target key (with ZL for the second set) and wait for the box to close; then press B to close the function page and return to the game.
+// Touch has two entry points (each front end wires them, the same way: Android touch_android.c, iOS front_ios.m):
+//   A, slot first: tap the cross on an empty skill slot (dm_ui_bind_begin), and the host walks these three steps for the player:
+//     1 Open the skill tree: after pressing + (function page), check whether SkillsTreePanel is open; if not, press R to flip pages until it is (at most 8 times);
+//     2 Wait for the player to tap a skill: the front end turns taps during this time into "move the controller cursor to the touch point + press Y"; once ButtonBindingModal is seen open, go to the next step; the player closing the skill tree themselves = cancel;
+//     3 Once the box has opened and settled, press the target key (with ZL for the second set) and wait for the box to close; then press B to close the function page and return to the game.
+//   B, skill first (the only way to rebind a key that already has a skill): in the skill tree, hold a skill icon still for 0.5 s; the front end moves the
+//     cursor onto the icon and presses Y, and the game pops its own binding box; tapping a cell in it presses that cell's key for the player
+//     (ui_bind_modal_tap), and the function page stays open afterwards (g_bd_stay).
+// Holding an in-game skill button does not rebind, it casts continuously (the earlier "long-press a skill button to rebind" was removed).
 // Whether a panel is open is read from the widget tree (name + visible flag), checked every 6 frames; each step has a frame limit, and on timeout it gives up and logs.
 static _Atomic uint64_t g_bd_key; static _Atomic int g_bd_state;   // 0 无 1 开技能树 5 找页 2 等点技能 3 框里按键 4 关面板 | 0 none 1 open skill tree 5 find page 2 wait for skill tap 3 press key in box 4 close panel
 static _Atomic int g_bd_stay;
@@ -1914,7 +1927,7 @@ static void ui_bind_pump(uint64_t root, uint64_t fr) {
 // 「透视地图尺寸」是配置变量 AutoMapMode（对象 main+0x2d479e8，值在 +0xC：0 全屏 / 1 微缩放左 / 2 微缩放右；注册处 main+0x30d2a8），注册时带变更回调 main+0x40f780(int 档)：
 //   [main+0x2d5e8f0] = 档 == 1（放左）；[main+0x2d5c748] = 档 != 0（是否微缩）；变了就调 main+0x411540 重排地图、把卷动量 [0x2d5e910 / 914] 清零。
 // 只改配置值不调回调，画面不变。这里直接调回调：切全屏传 0，切回传配置值（玩家在选项页选的放左 / 放右）；配置对象本身不动，所以不落盘、下一局照玩家的设置来。
-// 触屏模式记住玩家要不要全屏地图（g_map_want）：每局开头与玩家在选项页改档时取「配置是不是全屏档」，点小地图 / 点空处跟着改；
+// 触屏模式记住玩家要不要全屏地图（g_map_want）：每局开头与玩家在选项页改档时取「配置是不是全屏档」，点右上角小地图那一块跟着改（点空处不再改：点地面走路会误触，#186）；
 // 开面板时让成小地图（g_map_hold，前端报面板态），关掉面板、换区域后游戏按配置重建了地图，都按 g_map_want 再切回去。
 // 配置是全屏档（0）时小地图按「微缩放右」（2）显示，配置值不改写——玩家选的全屏照存照用（线上：选全屏无效、开装备栏 / 换图就回小地图）。
 // 手柄上没有切这一档的键（地图键 − 只管开 / 关）。
@@ -1923,7 +1936,7 @@ static void ui_bind_pump(uint64_t root, uint64_t fr) {
 //   [main+0x2d5e8f0] = mode == 1 (on the left); [main+0x2d5c748] = mode != 0 (mini or not); on a change it calls main+0x411540 to re-layout the map and zeroes the scroll values [0x2d5e910 / 914].
 // Changing only the config value without calling the callback leaves the picture unchanged. Here the callback is called directly: pass 0 to switch to fullscreen, pass the config value to switch back (left / right as the player chose on the options page); the config object itself is untouched, so nothing is persisted and the next run follows the player's setting.
 // In touch mode, remember whether the player wants the full-screen map (g_map_want): at the start of each run and whenever the player changes the setting on the options page it follows
-// "is the config the full-screen setting", and tapping the minimap / tapping empty space changes it; while a panel is open the map steps aside to the minimap (g_map_hold, the front end reports panel state),
+// "is the config the full-screen setting", and tapping the top-right minimap block changes it (tapping empty space no longer does: walking by tapping hit it, #186); while a panel is open the map steps aside to the minimap (g_map_hold, the front end reports panel state),
 // and after the panel closes, or after an area change in which the game rebuilt the map from the config, it is switched back to g_map_want.
 // With the config on full screen (0) the minimap is shown as "minimap right" (2) and the config value is not rewritten: the player's full-screen choice is kept and used (player report: choosing full screen had no effect, and opening the inventory / changing area went back to the minimap).
 // The controller has no key for switching this mode (the map key − only opens / closes).
@@ -1960,18 +1973,20 @@ static void ui_map_center(module_t *m, uint64_t root, int mini) {
 // the original map-opening path, which brings the area name back too (sending only PanelManager:OpenPanel AutoMap brought the lines back but not the area name at the top right, measured on the host).
 static _Atomic int g_map_movie;
 static void ui_map_pump(module_t *m, uint64_t root) {
-#if defined(__OHOS__)
-    // 鸿蒙的 UI 线程可能在选角面板加载时先请求收起地图；此时原版 AutoMap 尚未创建，回调会解引用空对象。
-    // 局外不调用地图回调，也不把旧请求带进下一局；游戏内的切换仍走原路径。
-    // The HarmonyOS UI thread can request a map reset while character select is loading, before the guest AutoMap exists.
-    // Discard out-of-game requests instead of calling the map callback or carrying them into the next game.
+    // 局外（前端各页、读取画面，按本帧界面判：有 HUD 且没有读取画面才算局内）一律不调原版地图切换 0x40f780：它经 0x411540 按当前关卡重建地图线条，
+    // 出局那几帧旧局的关卡数据已释放，读到的是垃圾指针。线上：一键重开回到前端、发出载入后的下一帧在 main+0x4117cc 崩（iOS 18.6，三次同址）。
+    // 不能拿 HUD 读数的 valid 当局内：它由服务端拍发布，出局后不再有拍，停在最后一次的 1。局外的切换请求也丢掉，不带进下一局。
+    // Outside a run (front-end pages, loading screen; judged from this frame's UI: in a run only with the HUD up and no loading screen), never call the
+    // original map switch 0x40f780: through 0x411540 it rebuilds the map lines from the current level, and in the frames after leaving a run the old
+    // level data is already freed, so it reads garbage pointers. Player report: quick restart crashed at main+0x4117cc on the frame after the load was
+    // sent from the front end (iOS 18.6, three times at the same address). The HUD readout's valid is not "in a run": it is published by the server
+    // tick, and with no ticks after leaving it stays at its last value 1. Out-of-run switch requests are dropped too, not carried into the next run.
     if (!dm_uiscreen_ingame()) {
         int pending = atomic_exchange(&g_map_req, -1);
         atomic_store(&g_map_full_now, 0);
-        if (pending >= 0) { static int n; if (n++ < 4) LOG("鸿蒙：局外地图切换请求已忽略（地图尚未就绪）"); }
+        if (pending >= 0) { static int n; if (n++ < 4) LOG("地图：局外的切换请求已丢掉（局外不调原版地图切换）"); }
         return;
     }
-#endif
     int cfg = *(volatile int32_t *)(m->base + 0x2d479f4), mini = *(volatile int32_t *)(m->base + 0x2d5c748);
     // 测试开关 DM_TEST_AUTOMAP=<帧>:<档>：到帧把配置改成这一档并调回调（当作玩家在选项页选了它）
     // Test switch DM_TEST_AUTOMAP=<frame>:<setting>: at that frame, change the config to this setting and call the callback (as if the player had picked it on the options page)
@@ -1987,10 +2002,10 @@ static void ui_map_pump(module_t *m, uint64_t root) {
         atomic_store(&g_map_full_now, mini == 0 && (cfg == 1 || cfg == 2)); return;
     }
     if (cfg != g_map_cfg_seen) {   // 每局第一次读到配置、或玩家在选项页改了档：要不要全屏跟配置走 | first config read in a run, or the player changed the setting on the options page: whether to show the full-screen map follows the config
-        g_map_want = cfg == 0; { static int n; if (n++ < 8) LOG("地图：「透视地图尺寸」读到 %d → 触屏下%s", cfg, cfg == 0 ? "缺省全屏地图（点空处回小地图）" : "缺省小地图"); } g_map_cfg_seen = cfg; }
+        g_map_want = cfg == 0; { static int n; if (n++ < 8) LOG("地图：「透视地图尺寸」读到 %d → 触屏下%s", cfg, cfg == 0 ? "缺省全屏地图（点右上角那一块回小地图）" : "缺省小地图"); } g_map_cfg_seen = cfg; }
     if (r >= 0 && g_map_want != r) { g_map_want = r; LOG("地图：玩家点了 → 记住%s", r ? "全屏地图" : "小地图"); }
     int small = cfg == 1 ? 1 : 2, hold = atomic_load(&g_map_hold), want = g_map_want == 1 && !hold;   // 全屏档时小地图按微缩放右显示 | with the full-screen setting, the minimap is shown as minimap right
-    if (hi.valid && (mini == 0) != want) {   // 局内才切（局外原版地图面板还没建）；换区域后游戏按配置重建、开关面板，都在这里对回去 | switch only in a run (outside one the original map panel does not exist yet); after an area change the game rebuilds from the config, and panels open / close: both are put right here
+    if (hi.valid && (mini == 0) != want) {   // 局外已在函数开头返回；valid 只保证读得到玩家。换区域后游戏按配置重建、开关面板，都在这里对回去 | out of a run already returned at the top; valid only means the player is readable. After an area change the game rebuilds from the config, and panels open / close: both are put right here
         ((void (*)(int))(m->base + 0x40f780))(want ? 0 : small); mini = *(volatile int32_t *)(m->base + 0x2d5c748);
         static int n; if (n++ < 40) LOG("地图：→ %s（%s；配置值 %d 不动）", want ? "全屏" : small == 1 ? "微缩放左" : "微缩放右", hold ? "面板开着先让开" : g_map_want ? "玩家要全屏" : "玩家要小地图", cfg); }
     atomic_store(&g_map_full_now, mini == 0);

@@ -48,6 +48,10 @@ __attribute__((weak)) float dm_bright_k(void);
 // The host side of the over-the-shoulder / first-person camera (dm/host/dm_cam.c): the switch, the heading the follow wants, the matrices published
 // for input conversion, how far the wall behind the character is; weak: graphics unit tests without the host keep the camera off
 __attribute__((weak)) int dm_cam_mode(void);
+__attribute__((weak)) int dm_cam_style(void);
+__attribute__((weak)) int dm_cam_attack_dir(float *wx,float *wz);
+__attribute__((weak)) void dm_cam_publish_height(float py);
+__attribute__((weak)) int dm_cam_ahead_pick(float rx,float rz,int host_ok,float hx,float hz,float fx,float fz,float *ox,float *oz);
 __attribute__((weak)) int dm_cam_want_dir(float *wx,float *wz);
 __attribute__((weak)) int dm_cam_clearance(float bx,float bz,float *dist,float *px,float *pz);
 __attribute__((weak)) float dm_cam_take_turn(void);
@@ -408,7 +412,7 @@ struct Buffer {
     void invalidate(){if(coherent)return;VkMappedMemoryRange r{VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE};r.memory=memory;r.size=VK_WHOLE_SIZE;VK(vkInvalidateMappedMemoryRanges(cfg.device,1,&r));}
 };
 struct Arena {
-    std::vector<ArenaChunk> chunks;size_t current=0;bool cached=false;VkDeviceSize used_total=0,peak=0;
+    std::vector<ArenaChunk> chunks;size_t current=0,peak_chunks=3;bool cached=false;VkDeviceSize used_total=0,peak=0;
     ArenaChunk make(VkDeviceSize bytes){
         CPU_SCOPE(Buffer);ArenaChunk c;c.size=bytes;
         VkBufferCreateInfo ci{VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};ci.size=bytes;ci.usage=arena_usage;ci.sharingMode=VK_SHARING_MODE_EXCLUSIVE;VK(vkCreateBuffer(cfg.device,&ci,nullptr,&c.buffer));
@@ -435,7 +439,12 @@ struct Arena {
     // reset() keeps all memory mapped (a synchronous reader may still copy out
     // of it); trim() releases oversized/extra chunks before the next recording.
     size_t keep_chunks=3;
-    void reset(){for(auto &c:chunks)c.used=0;current=0;used_total=0;}
+    // current is the highest chunk index the just-finished recording placed anything into (alloc only ever advances it),
+    // so current+1 is exactly that recording's chunk usage. Capture it here — trim() runs after this and needs it to
+    // decide retention; a plain chunks.size() would pin the historical peak and never shrink.
+    // current 是刚结束的那次录制实际用到的最高块号（分配只会前进），所以 current+1 就是这次录制的块用量。
+    // 在 reset() 里记下来是因为 trim() 在它之后才跑、要据此决定保留多少块；直接用 chunks.size() 会钉住历史峰值、再也不缩。
+    void reset(){peak_chunks=current+1;for(auto &c:chunks)c.used=0;current=0;used_total=0;}
     void trim(){
         size_t kept=0;std::vector<ArenaChunk> keep;
         for(auto &c:chunks){if(c.size==arena_chunk_bytes && kept<keep_chunks){keep.push_back(c);++kept;}else destroy(c);}
@@ -519,6 +528,11 @@ uint64_t cleanup_ns[5]={},writeback_bytes=0; // perf: cleanup phase split
 // Driver/support constant buffers are rebuilt only when their inputs change (iOS: reuse parameter
 // blocks for identical inputs). Generations bump on binding ops; slot_serial on every frame-slot switch.
 uint64_t tex_gen[6]={},buf_gen[6]={},slot_serial=1;
+// Last in-run re-upload of a software-decoded BC image (GPUs without BC). The burst-sized stream arena and the upload caches
+// of get_image_slow are kept only while these keep coming; soft_bc_idle_ns without one returns them to the normal footprint.
+// 最近一次软解 BC 图（显卡不支持 BC）在局内重传的时刻。突发用的 stream arena 块数与 get_image_slow 的上传缓存只在重传持续时保留；
+// 超过 soft_bc_idle_ns 没有重传就退回平常的占用。
+uint64_t soft_bc_reupload_ns=0;constexpr uint64_t soft_bc_idle_ns=10ull*1000000000;
 struct DriverCache{uint64_t gen=0,slot=0;Buffer buffer;};DriverCache driver_cache[6][2];
 struct SupportCache{float w=-1,h=-1;uint64_t slot=0;Buffer buffer;};SupportCache support_cache;
 struct SetKeyHash{size_t operator()(const std::vector<uint64_t> &k)const{uint64_t h=1469598103934665603ull;for(uint64_t v:k){h^=v;h*=1099511628211ull;h^=h>>32;}return size_t(h);}};
@@ -823,6 +837,19 @@ Slot &recording_slot(){
          s.guard.clear();if(o.pending && xview_guard && !ab_off("xguard"))s.guard.swap(s.viewed);s.viewed.clear();s.pro_ops.clear();s.pro_images.clear();}
         // Pending writebacks still read this slot's readback arena; finish them before trimming.
         for(auto &w:pending_writebacks)if(w.slot==&s){++perf.why_slot;resolve_pending();break;}
+        // Keep what this recording actually needed (3..8): during streamed bursts the arena grew to 7+ chunks
+        // per frame, and trim() released them — every burst frame paid chunk creation + first-touch page faults inside the
+        // timed staging copy (measured up to 7 ms/image). The readback arena below already self-sizes; the stream one matches.
+        // Grow-only: shrinking per-frame defeated the point — normal frames use 1 chunk, and every next burst then re-created + first-touched
+        // chunks again (measured unchanged 8ms/image staging over four burst frames 375-397ms apart). Bounded by 8 (256MB/slot),
+        // and only while soft-decoded BC images keep re-uploading: once they stop, back to 3.
+        // 保留这次录制真正用到的块数（3..8）：流式突发时 arena 会一帧长到 7+ 块，而 trim() 把它们全放了，
+        // 于是每一突发帧都要在计时的 staging 拷贝里重新建块并吃首次访问的缺页（实测每张图最多 7 ms）。
+        // 只增不减：按帧收缩等于没做——普通帧只用 1 块，下一个突发帧又得重新建块（连测四帧 375-397ms，staging 仍是 8ms/张）。
+        // 上限 8 块（每槽 256MB），且只在软解 BC 图持续重传期间保留：停下来以后回到 3 块。
+        if(soft_bc_reupload_ns && timing_clock()-soft_bc_reupload_ns<soft_bc_idle_ns)
+            s.stream.keep_chunks=std::max({(size_t)3,std::min((size_t)8,s.stream.peak_chunks),s.stream.keep_chunks});
+        else s.stream.keep_chunks=3;
         s.stream.trim();s.readback.keep_chunks=s.guard.empty()?1:s.readback.chunks.size();s.readback.trim();
         if(texel_memo_enabled && (slot_serial&15)<2)texel_evict(slot_index,false);   // this slot's copies: its previous submission retired
         if(!s.cmd){if(slot_pools_enabled){VkCommandPoolCreateInfo cp{VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};cp.queueFamilyIndex=cfg.queue_family;VK(vkCreateCommandPool(cfg.device,&cp,nullptr,&s.pool));}
@@ -1497,12 +1524,50 @@ uint64_t hash_memory(const void *memory,size_t n){CPU_SCOPE(Hash);const uint8_t 
     uint64_t h[4]={1469598103934665603ull,0x9e3779b97f4a7c15ull,0xc2b2ae3d27d4eb4full,0x165667b19e3779f9ull};size_t i=0;
     for(;i+32<=n;i+=32){for(unsigned k=0;k<4;k++){uint64_t w;memcpy(&w,p+i+8*k,8);h[k]=(h[k]^w)*0x100000001b3ull;h[k]^=h[k]>>29;}}
     uint64_t hash=h[0]^(h[1]*3)^(h[2]*5)^(h[3]*7)^n;for(;i<n;i++){hash^=p[i];hash*=1099511628211ull;}return hash;}
+// Grow-only upload scratch: keeps capacity between calls and never zero-fills. std::vector<uint8_t>::resize
+// value-initializes, and on this path that meant a full-image memset plus malloc/free on every (re)upload —
+// measured on a Mali-G925 (in-run BC re-uploads) at ~4-5 ms per 4 MB image, roughly half the per-cycle cost.
+// Only used from the single thread that records submissions, like the vectors it replaces.
+// 只增不减的上传暂存：跨调用保留容量、且从不填零。std::vector<uint8_t>::resize 会做值初始化，在这条路径上等于
+// 每次（重）上传都要整图 memset 外加 malloc/free——Mali-G925 实测 4 MB 图约 4-5 ms，约占单次循环一半。
+// 与它替换掉的 vector 一样，只由录制提交的那一个线程使用。
+struct UpScratch{uint8_t *p=nullptr;size_t cap=0,n=0;
+    void reset(){n=0;}
+    void resize(size_t m){if(m<=cap){n=m;return;}size_t c=m+(m>>1)+65536u;uint8_t *q=static_cast<uint8_t*>(::operator new(c));if(n)memcpy(q,p,n);::operator delete(p);p=q;cap=c;n=m;}
+    uint8_t *data(){return p;} const uint8_t *data()const{return p;} size_t size()const{return n;}
+    void release(){::operator delete(p);p=nullptr;cap=n=0;}
+    ~UpScratch(){::operator delete(p);}};
+thread_local UpScratch up_linear,up_blocks;   // get_image's upload buffers | get_image 的上传缓冲
+// Differential block decode for re-uploaded decoded BC images. Consecutive re-saves of the streamed cubes
+// (BC6H 256x256x6) change only 1.7-1.8% of their 16-byte blocks, yet every cycle decoded the whole image — 6.2 ms of the
+// 8.3 ms per cycle. BC blocks are independent, so decode only the blocks whose compressed bytes changed and keep the last
+// decoded image as the base: identical output, ~1 ms per cycle. Bounded to 16 images, ordered by hotness, and an image must
+// have re-uploaded 3 times before it takes a slot, so load-time one-offs cannot evict the images that cycle every frame.
+// 重上传的解码 BC 图做块级差分解码：连续两次重存的流式立方图（BC6H 256x256x6）只改了 1.7-1.8% 的 16 字节块，
+// 但每次都整图解码（每循环 8.3 ms 里 6.2 ms 在解码）。BC 的块彼此独立，所以只解压缩字节变了的块、以上次解码结果
+// 为基底：输出完全一致，每循环约 1 ms。最多 16 张，按热度排序，且一张图要先重传 3 次才占槽，
+// 这样载入期的一次性大图不会把每帧都循环的图挤出去。
+struct UpDiff{
+    std::vector<uint8_t> src,src_new,out;std::vector<uint32_t> off;   // off: byte offset of each sub-resource inside src/src_new | off：各子资源在 src/src_new 内的字节偏移
+    uint32_t fmt=0,layers=0,levels=0,width=0,height=0,bpp=0;size_t total=0,total_src=0;unsigned verify=2;bool ready=false;
+    uint64_t used=0;   // last-use stamp; the hot re-uploaded images must win the slots over the load-time ones | 最近使用时间戳：真正循环的图要优先于载入期一次性图拿到槽位
+};
+std::map<uint64_t,UpDiff> up_diffs;uint64_t up_diff_clock=0,up_diff_bytes=0;std::map<uint64_t,unsigned> up_diff_seen;
+// Byte budget of the differential state (src + src_new + out of every slot) and the size of the re-upload counter map.
+// 差分状态的字节预算（所有槽的 src + src_new + out 之和），以及重传计数表的条目上限。
+constexpr uint64_t up_diff_budget=64ull*1024*1024;constexpr size_t up_diff_seen_max=4096;
+size_t up_diff_size(const UpDiff &d){return d.src.size()+d.src_new.size()+d.out.size();}
+void upload_cache_release(){up_diffs.clear();up_diff_bytes=0;up_diff_seen.clear();up_linear.release();up_blocks.release();}
 void invalidate_cpu_range(uint64_t address,uint64_t bytes){CPU_SCOPE(CpuWrite);
     need(address+bytes>=address,"CPU write range overflow");cpu_access(address,bytes,4);snapshot_invalidate(address,bytes);
     for_images_overlapping(address,bytes,[&](Image &im){if(draw_detail)draw_timing.image();uint64_t begin=uintptr_t(im.source.mem),end=begin+im.source.L.size;
         // A full storage overwrite replaces the prior GPU contents. A partial
         // overwrite requires GPU-to-NVN readback/merge before applying CPU data.
         need(!im.gpu_written || (address<=begin && address+bytes>=end),"Partial CPU write aliases GPU-written texture; readback/merge required");
+        // The device now holds GPU-written contents, not the bytes cpu_hash describes: forget it so the upload below cannot be
+        // skipped because the guest happened to write back what it last uploaded.
+        // 设备里现在是 GPU 写出的内容，不是 cpu_hash 所描述的字节：清掉它，免得客户机恰好写回上次上传的字节时下面的上传被跳过。
+        if(im.gpu_written)im.cpu_hash=0;
         im.gpu_written=false;provenance_write(im,__LINE__);im.uploaded=false;im.checked_submission=UINT64_MAX;
     });
 }
@@ -1597,7 +1662,7 @@ bool gpu_poll_complete(){
 }
 // Vulkan buffer/image transfers name exactly one depth/stencil aspect. Keep
 // both packed NVN channels, with independent tightly packed planes and copies.
-void append_depth_planes(std::vector<uint8_t> &data,std::vector<VkBufferImageCopy> &copies,
+template<class Buf> void append_depth_planes(Buf &data,std::vector<VkBufferImageCopy> &copies,
     uint32_t format,uint32_t w,uint32_t h,uint32_t slices,const void *packed,size_t packed_bytes,
     size_t row,size_t image,const VkBufferImageCopy &region){
     xbg_depth_format f;need(xbg_depth_format_info(format,&f)==0,"Unknown NVN depth transfer format");
@@ -1702,13 +1767,69 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
         im.checked_submission=stats.submissions;}
     // Diagnostic: CPU writes into textures whose contents the GPU produced (copies) are invisible to us.
     if(upload && im.gpu_written && im.decoded && t->mem && ((stats.submissions+t->serial)&63)==0 && im.checked_submission!=stats.submissions){im.checked_submission=stats.submissions;uint64_t hash=hash_memory(t->mem,t->L.size);if(im.cpu_hash && hash!=im.cpu_hash){static unsigned n=0;if(n++<40)xbg_logf("NVN CPUGPU texture changed by CPU after GPU write serial=%llu fmt=%#x %ux%u layers=%u levels=%u target=%d",(unsigned long long)t->serial,t->d.format,im.width,im.height,im.layers,im.levels,t->d.target);}im.cpu_hash=hash;}
+    // Verification proved the differential output byte-identical over 6147 cycles; it costs a full decode per checked cycle, so
+    // it is opt-in now (DM_BC_DIFFVERIFY=1) — leaving it on made every slot change pay a full decode and slowed bursts 4x.
+    // 自校验已证明 6147 次差分输出与全量解码逐字节相同；它每校验一次就要多跑一次全量解码，所以改为按需开启
+    // （DM_BC_DIFFVERIFY=1）——常开时每次换槽都付一次全量解码，突发帧慢了 4 倍。
+    static int up_diff_verify=-1;if(up_diff_verify<0){const char *e=getenv("DM_BC_DIFFVERIFY");up_diff_verify=e&&*e=='1';}
     if(upload && !im.uploaded && !im.gpu_written){
         const uint64_t up_t0=timing_clock();const bool reupload=im.cpu_hash!=0;
+        // Free the upload caches once soft-decoded BC re-uploads have stopped. Done here, before this upload touches them, and not
+        // in recording_slot: stream_buffer below can start a recording while the scratch and the differential state are in use.
+        // 软解 BC 重传停下来以后释放上传缓存。放在这里、在本次上传用到它们之前，而不放在 recording_slot：下面的 stream_buffer
+        // 可能在暂存与差分状态还在用的时候开新录制。
+        if(soft_bc_reupload_ns && up_t0-soft_bc_reupload_ns>=soft_bc_idle_ns){soft_bc_reupload_ns=0;upload_cache_release();}
+        if(reupload && im.decoded)soft_bc_reupload_ns=up_t0;
+        // Skip when the guest bytes equal what the device already holds. The streamed HDR cubes (BC6H 256x256x6) cycle
+        // GetData -> CPU store -> Load 50+ times per frame on some scenes, and engine-side invalidation marks them dirty even
+        // when the game restored identical bytes; each needless cycle costs a full BC decode. The same hash answers the
+        // per-submission recheck above; using it here makes that question free.
+        // The skip-check hash and the uploaded-content hash describe the same bytes on the same thread — compute once. On the
+        // recurring ~110-small-image cycles the doubled hash was ~40% of the per-image cost (~0.25 ms of 0.65 ms).
+        // 客户机字节与设备里已有内容相同时直接跳过上传。流式 HDR 立方图（BC6H 256x256x6）在某些场景里一帧要走
+        // 50+ 次 GetData -> CPU 写 -> Load，游戏即使把同样的字节写了回去，引擎侧的失效也会把它标脏，
+        // 每次多余循环都要付一次完整 BC 解码；上面每次提交的复查用的是同一个哈希，这里顺手复用，等于白拿。
+        // 跳过判定用的哈希和上传后记录内容用的哈希是同一份字节、同一个线程算的，所以只算一次——
+        // 在反复出现的 ~110 张小图循环里，算两遍约占单张成本 40%（0.65 ms 里的 0.25 ms）。
+        uint64_t fresh_hash=0;const bool can_skip=t->mem&&im.cpu_hash;
+        if(can_skip&&((fresh_hash=hash_memory(t->mem,t->L.size))==im.cpu_hash)){im.uploaded=true;im.checked_submission=stats.submissions;}
+        else{
         im.dirty_stamp=0;   // a new upload starts on the hash checks again
         need(im.samples==VK_SAMPLE_COUNT_1_BIT,"Cannot upload uninitialized multisample image from CPU storage");
         need(t->mem && t->pool && t->off>=0 && uint64_t(t->off)<=t->pool->size && t->L.size<=t->pool->size-uint64_t(t->off),"Texture storage outside memory pool");
         if(im.aspects!=VK_IMAGE_ASPECT_COLOR_BIT)xbg_logf("NVN depth initial upload serial=%llu format=%#x vkFormat=%u target=%d extent=%ux%ux%u levels=%u layers=%u source=%p bytes=%llu",(unsigned long long)t->serial,t->d.format,unsigned(im.fmt),t->d.target,im.width,im.height,im.depth,im.levels,im.layers,t->mem,(unsigned long long)t->L.size);
-        std::vector<uint8_t> linear;std::vector<VkBufferImageCopy> copies;
+        UpScratch &linear=up_linear;linear.reset();std::vector<VkBufferImageCopy> copies;
+        // Choose the differential state for this image and pre-compute its sub-resource layout. | 为这张图挑出差分状态并预先算好子资源布局。
+        UpDiff *dif=nullptr;uint8_t *out_base=nullptr;size_t run=0;
+        // Any decoded BC image qualifies (the cube family is not the only one cycling): the slots are hotness-ordered, so a
+        // load-time image never keeps a slot away from the images that actually re-upload every frame.
+        // 任何解码 BC 图都够格（会循环的不止立方图那一族）：槽位按热度排序，载入期的图不会占着槽不让每帧重传的图用。
+        if(up_diff_seen.size()>=up_diff_seen_max && !up_diff_seen.count(t->serial))up_diff_seen.clear();   // stale serials of freed images | 已释放图的旧序号
+        unsigned &seen=up_diff_seen[t->serial];if(reupload)++seen;   // only images that really cycle are worth a slot | 只有真正在循环的图才配占槽
+        if(im.decoded && im.depth==1 && t->L.size>=16ull*1024 && t->L.size<=up_diff_budget/32 && seen>=3){
+            // Evict least recently used slots until a new one fits both the count (16) and the byte budget; the incoming image's
+            // own size is not known before its layout, so its payload is capped above at budget/32 (decoded output is at most 8x the
+            // BC payload, so one image stays under budget/4 and the total under the budget).
+            // 按最久未用淘汰，直到新槽同时满足条数（16）与字节预算；进来的图在算布局前不知道大小，所以上面限单张负载 ≤ 预算/32
+            // （解码输出最多是 BC 负载的 8 倍，单张不超过预算的 1/4，总量不超过预算）。
+            if(!up_diffs.count(t->serial))while(!up_diffs.empty() && (up_diffs.size()>=16 || up_diff_bytes>up_diff_budget*3/4)){
+                auto old=up_diffs.begin();for(auto i=up_diffs.begin();i!=up_diffs.end();++i)if(i->second.used<old->second.used)old=i;
+                up_diff_bytes-=up_diff_size(old->second);up_diffs.erase(old);}
+            UpDiff &d=up_diffs[t->serial];up_diff_bytes-=up_diff_size(d);d.used=++up_diff_clock;
+            bool same=d.ready && d.fmt==uint32_t(t->d.format) && d.layers==im.layers && d.levels==im.levels && d.width==im.width && d.height==im.height && d.bpp==im.bpp;
+            size_t ts=0,to=0;std::vector<uint32_t> offs;
+            for(uint32_t layer=0;layer<im.layers;layer++)for(uint32_t level=0;level<im.levels;level++){
+                uint32_t w=std::max(1u,im.width>>level),h=std::max(1u,im.height>>level);
+                offs.push_back(uint32_t(ts));int bw=0,bh=0;int bb=nvn_fmt_bpb(t->d.format,&bw,&bh);
+                ts+=size_t((w+bw-1)/bw)*((h+bh-1)/bh)*size_t(bb);
+                to=(to+15)&~size_t(15);to+=size_t(w)*h*im.bpp;}
+            if(!same || d.total!=to || d.total_src!=ts || d.off.size()!=offs.size())d=UpDiff{};
+            d.fmt=t->d.format;d.layers=im.layers;d.levels=im.levels;d.width=im.width;d.height=im.height;d.bpp=im.bpp;
+            d.total=to;d.total_src=ts;d.off=offs;
+            d.src.resize(ts);d.out.resize(to);d.src_new.resize(ts);   // src_new is the deswizzle target of this cycle, including the first one | src_new 是本轮反 swizzle 的目标，第一轮也是
+            up_diff_bytes+=up_diff_size(d);
+            dif=&d;out_base=d.out.data();
+        }
         for(uint32_t layer=0;layer<im.layers;layer++)for(uint32_t level=0;level<im.levels;level++){
             uint32_t w=std::max(1u,im.width>>level),h=std::max(1u,im.height>>level),depth=std::max(1u,im.depth>>level);
             if(im.aspects!=VK_IMAGE_ASPECT_COLOR_BIT){
@@ -1718,23 +1839,36 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
                 VkBufferImageCopy region{};region.imageSubresource={0,level,layer,1};region.imageExtent={w,h,depth};
                 append_depth_planes(linear,copies,t->d.format,w,h,depth,packed.data(),packed.size(),0,0,region);continue;
             }
-            size_t begin=(linear.size()+15)&~size_t(15);
+            if(!out_base)run=linear.size();   // track the running output size for the differential path | 差分路径下跟踪累计输出长度
+            size_t begin=(run+15)&~size_t(15);
             int cbw=1,cbh=1;bool native_blocks=!im.decoded && nvn_fmt_bpb(t->d.format,&cbw,&cbh) && (cbw>1 || cbh>1);
             if(native_blocks){ // ASTC etc.: copy whole blocks, rows of blocks
                 uint32_t bx=(w+cbw-1)/cbw,by=(h+cbh-1)/cbh;linear.resize(begin+size_t(bx)*by*depth*im.bpp);
                 need(nvn_deswizzle(&t->d,level,layer,t->mem,linear.data()+begin,size_t(bx)*im.bpp)==0,"Compressed texture deswizzle failed");
                 VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);continue;}
-            linear.resize(begin+size_t(w)*h*depth*im.bpp);
+            if(!out_base)linear.resize(begin+size_t(w)*h*depth*im.bpp);else run=begin+size_t(w)*h*depth*im.bpp;
             if(im.decoded){
                 int bw,bh,block_bytes=nvn_fmt_bpb(t->d.format,&bw,&bh);uint32_t blocks_x=(w+bw-1)/bw,blocks_y=(h+bh-1)/bh;
-                std::vector<uint8_t> blocks(size_t(blocks_x)*blocks_y*depth*block_bytes);
-                need(nvn_deswizzle(&t->d,level,layer,t->mem,blocks.data(),size_t(blocks_x)*block_bytes)==0,"BC image deswizzle failed");
-                need(xbg_decode_bc_linear(t->d.format,w,h,depth,blocks.data(),blocks.size(),0,0,linear.data()+begin,size_t(w)*h*depth*im.bpp)==0,"BC image decode failed");
+                UpScratch &blocks=up_blocks;if(!dif)blocks.resize(size_t(blocks_x)*blocks_y*depth*block_bytes);
+                uint8_t *bdst=dif?dif->src_new.data()+dif->off[size_t(layer)*im.levels+level]:blocks.data();
+                need(nvn_deswizzle(&t->d,level,layer,t->mem,bdst,size_t(blocks_x)*block_bytes)==0,"BC image deswizzle failed");
+                uint8_t *odst=(dif?out_base:linear.data())+begin;
+                if(dif&&dif->ready){   // decode only the blocks whose compressed bytes changed | 只解压缩字节发生了变化的块
+                    const uint32_t bo=dif->off[size_t(layer)*im.levels+level];uint8_t pixels[128];
+                    for(uint32_t by=0;by<blocks_y;by++)for(uint32_t bx=0;bx<blocks_x;bx++){
+                        size_t bi=(size_t(by)*blocks_x+bx)*block_bytes;
+                        if(!memcmp(dif->src.data()+bo+bi,bdst+bi,block_bytes))continue;
+                        need(xbg_decode_block(t->d.format,bdst+bi,block_bytes,pixels,sizeof(pixels))==0,"BC block decode failed");
+                        for(unsigned y=0;y<4 && by*4+y<h;y++)for(unsigned x=0;x<4 && bx*4+x<w;x++)
+                            memcpy(odst+(((size_t)by*4+y)*w+bx*4+x)*im.bpp,pixels+(y*4+x)*im.bpp,im.bpp);}
+                }else{
+                    need(xbg_decode_bc_linear(t->d.format,w,h,depth,bdst,size_t(blocks_x)*blocks_y*depth*block_bytes,0,0,odst,size_t(w)*h*depth*im.bpp)==0,"BC image decode failed");}
             }else if(t->d.flags&0x10){need(!layer && !level && depth==1,"Linear mip/layer/volume texture not implemented");size_t pitch=t->d.stride?t->d.stride:(w*im.bpp+31)&~size_t(31);for(uint32_t y=0;y<h;y++)memcpy(linear.data()+begin+y*w*im.bpp,t->mem+y*pitch,w*im.bpp);}
             else need(nvn_deswizzle(&t->d,level,layer,t->mem,linear.data()+begin,size_t(w)*im.bpp)==0,"Texture deswizzle failed");
             VkBufferImageCopy c{};c.bufferOffset=begin;c.imageSubresource={im.aspects,level,layer,1};c.imageExtent={w,h,depth};copies.push_back(c);
         }
-        Buffer staging=stream_buffer(linear.size(),linear.data(),linear.size(),false);for(auto &copy:copies)copy.bufferOffset+=staging.offset;
+        const size_t up_bytes=out_base?run:linear.size();
+        Buffer staging=stream_buffer(up_bytes,out_base?out_base:linear.data(),up_bytes,false);for(auto &copy:copies)copy.bufferOffset+=staging.offset;
         // gfx-upload-prologue：这次提交里还没有命令用过这张图，它的新内容可以排在整个提交之前，前面没有读到旧内容的命令。
         // gfx-upload-prologue: no command of this submission used this image yet, so its new contents can go ahead of the whole
         // submission; no earlier command read the old contents.
@@ -1742,8 +1876,23 @@ Image &get_image_slow(const tex_t *t,bool upload){CPU_SCOPE(Image);
             s.pro_images.push_back({im.image,im.layout,im.aspects,im.levels,im.layers,staging.buffer,copies});im.layout=VK_IMAGE_LAYOUT_GENERAL;++uploads_prologue;}
         else{++uploads_inpass;if(open_pass.cmd)++uploads_broke_pass;
             Commands c;im.transition(c.command,VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);vkCmdCopyBufferToImage(c.command,staging.buffer,im.image,im.layout,copies.size(),copies.data());im.transition(c.command,VK_IMAGE_LAYOUT_GENERAL);c.finish();}
-        im.uploaded=true;provenance_write(im,__LINE__);im.cpu_hash=hash_memory(t->mem,t->L.size);im.checked_submission=stats.submissions;
-        if(reupload)++hud::reuploads;else ++hud::uploads;hud::upload_bytes+=linear.size();hud::upload_ns+=timing_clock()-up_t0;
+        im.uploaded=true;provenance_write(im,__LINE__);im.cpu_hash=can_skip?fresh_hash:hash_memory(t->mem,t->L.size);im.checked_submission=stats.submissions;
+        if(dif){   // this cycle's compressed source becomes the next comparison base | 本轮的压缩源成为下一轮的比较基准
+            dif->src.swap(dif->src_new);
+            if(!dif->ready)dif->ready=true;
+            else if(dif->verify && up_diff_verify){--dif->verify;   // opt-in: compare against a full decode of the same bytes | 按需开启：与同样字节的全量解码结果对比
+                bool bad=false;size_t at=0;std::vector<uint8_t> ref(dif->total);
+                for(uint32_t layer=0;layer<dif->layers&&!bad;layer++)for(uint32_t level=0;level<dif->levels&&!bad;level++){
+                    uint32_t w=std::max(1u,dif->width>>level),h=std::max(1u,dif->height>>level);
+                    int bw=0,bh=0;int bb=nvn_fmt_bpb(dif->fmt,&bw,&bh);uint32_t bxs=(w+bw-1)/bw,bys=(h+bh-1)/bh;
+                    size_t begin=(at+15)&~size_t(15);at=begin+size_t(w)*h*dif->bpp;
+                    if(xbg_decode_bc_linear(dif->fmt,w,h,1,dif->src.data()+dif->off[size_t(layer)*dif->levels+level],size_t(bxs)*bys*size_t(bb),0,0,ref.data()+begin,size_t(w)*h*dif->bpp))bad=true;
+                    else if(memcmp(ref.data()+begin,dif->out.data()+begin,size_t(w)*h*dif->bpp))bad=true;}
+                xbg_logf("NVN bd-verify serial=%llu %s",(unsigned long long)t->serial,bad?"MISMATCH - differential disabled for this image":"ok");
+                if(bad){dif->ready=false;dif->verify=0;}}
+        }
+        if(reupload)++hud::reuploads;else ++hud::uploads;hud::upload_bytes+=up_bytes;hud::upload_ns+=timing_clock()-up_t0;
+        }
     }
     provenance_image(upload?"GET_UPLOAD":"GET",t,im);im.slot_use=slot_serial;return im;
 }
@@ -2452,7 +2601,7 @@ Buffer uniform_snapshot_cached(uint64_t address,size_t copy);
 namespace cam {
 const char *const cull_cs="1188eaedc8db3285";
 int mode_=-1;xbg_cam_params params;xbg_cam_state st;uint64_t patches=0,scenes=0,widened=0;
-float clear=0,host_px=0,host_pz=0,turned=0;bool clear_ok=false;
+float clear=0,host_px=0,host_pz=0,turned=0,drag_k=0.5f,pull_pitch=40,pull_min=5,pull_near=10,pull_blend=4;bool clear_ok=false;uint64_t drift_frame=0;
 struct Copy{uint64_t address=0,bytes=0,epoch=0;Buffer buffer;};std::array<Copy,8> copies;unsigned next=0;
 float envf(const char *k,float d){const char *e=getenv(k);return e?float(atof(e)):d;}
 int mode(){
@@ -2461,10 +2610,16 @@ int mode(){
     const int m=dm_cam_mode?dm_cam_mode():0;
     if(m!=mode_){mode_=m;
         if(mode_>0){params=xbg_cam_default_params(mode_);
+            // 原神式（宿主 dm_cam_style = 1）的越肩缺省机位：没有上下拖调俯仰，视野靠机位给——前看 7、水平视角 70°、上沿不设远处限制
+            // （画面上沿只保留水平线下 3°）。远处游戏还没画的地方会露黑块，用户在 OnePlus 13 上看过：视野更要紧，可以接受。下面的环境变量照样能改
+            // Over-the-shoulder defaults of the Genshin style (host dm_cam_style = 1): with no dragged pitch, the view has to come from the rig -- look-ahead 7,
+            // horizontal field of view 70 degrees, no far limit for the top edge (only the 3 degrees below the horizon stays). Far ground the game has not drawn
+            // yet shows black patches; the user saw them on a OnePlus 13 and judged the view more important. The environment variables below still override
+            if(mode_==1 && dm_cam_style && dm_cam_style()==1){params.look=7;params.fov=70;params.reach=0;}
             params.dist=envf("DM_CAM_DIST",params.dist);params.h=envf("DM_CAM_H",params.h);params.look=envf("DM_CAM_LOOK",params.look);params.lookh=envf("DM_CAM_LOOKH",params.lookh);
             params.eye=envf("DM_CAM_EYE",params.eye);params.fwd=envf("DM_CAM_FWD",params.fwd);params.pitch=envf("DM_CAM_PITCH",params.pitch);params.fov=envf("DM_CAM_FOV",params.fov);
-            params.tau=envf("DM_CAM_TAU",params.tau);params.near_=envf("DM_CAM_NEAR",params.near_);params.reach=envf("DM_CAM_REACH",params.reach);xbg_cam_init(&st);
-            xbg_logf("NVN cam mode=%d dist=%g h=%g look=%g lookh=%g eye=%g fwd=%g pitch=%g fov=%g tau=%g near=%g reach=%g",mode_,params.dist,params.h,params.look,params.lookh,params.eye,params.fwd,params.pitch,params.fov,params.tau,params.near_,params.reach);}}
+            params.tau=envf("DM_CAM_TAU",params.tau);params.near_=envf("DM_CAM_NEAR",params.near_);params.reach=envf("DM_CAM_REACH",params.reach);drag_k=envf("DM_CAM_DRAG",0.5f);pull_pitch=envf("DM_CAM_PULL_PITCH",40);pull_min=envf("DM_CAM_PULL_MIN",5);pull_near=envf("DM_CAM_PULL_NEAR",10);pull_blend=envf("DM_CAM_PULL_BLEND",4);xbg_cam_init(&st);
+            xbg_logf("NVN cam mode=%d dist=%g h=%g look=%g lookh=%g eye=%g fwd=%g pitch=%g fov=%g tau=%g near=%g reach=%g drag=%g pull=%g/%g near=%g+%g",mode_,params.dist,params.h,params.look,params.lookh,params.eye,params.fwd,params.pitch,params.fov,params.tau,params.near_,params.reach,drag_k,pull_pitch,pull_min,pull_near,pull_blend);}}
     return mode_;
 }
 // 绑定长度：认出主相机或场景块（先读客体内存里签名那几行，便宜）就返回整块长度，否则原样返回 copy
@@ -2488,22 +2643,55 @@ Buffer patch(uint64_t address,size_t copy,const Buffer &src){
         // Follow once per frame: the host's heading (aim drag > move stick) first, then the character's displacement; the over-the-shoulder mode
         // publishes both matrix sets for input conversion, first person does not convert input
         float px,py,pz,wx=0,wz=0;xbg_cam_ground(p,&px,&py,&pz);const int want=dm_cam_want_dir?dm_cam_want_dir(&wx,&wz):0;
+        // 原版画面往前挪（宿主 dm_cam.c DM_CAM_AHEAD）：认出这一帧原版镜头带的挪动量，从人物点里扣掉；xbg_cam_build 里同样扣（st.ahead）
+        // The original picture moved ahead (host dm_cam.c DM_CAM_AHEAD): recognise the shift this frame's original camera carries and remove it from the
+        // character point; xbg_cam_build removes it the same way (st.ahead)
+        st.ahead[0]=st.ahead[1]=0;
+        if(dm_cam_ahead_pick){float c=0,hx=0,hz=0;const int hok=dm_cam_clearance && dm_cam_clearance(-st.fx,-st.fz,&c,&hx,&hz);dm_cam_ahead_pick(px,pz,hok,hx,hz,st.fx,st.fz,&st.ahead[0],&st.ahead[1]);px-=st.ahead[0];pz-=st.ahead[1];}
         // 体感转向（宿主 dm_cam.c）：每帧取走一次累计的转动；最近一秒内转过就让跟随不动朝向，转动在跟随之后加上
         // Sensor steering (host dm_cam.c): take the accumulated turn once per frame; with a turn within the last second the follow leaves the heading alone,
         // and the turn is added after the follow
         const uint64_t frame=stats.presents.load();float turn=0;
         if(frame!=st.frame){turn=dm_cam_take_turn?dm_cam_take_turn():0;st.hold=dm_cam_turn_age && dm_cam_turn_age()<1.0;}
-        const double t0=st.t;const bool fresh=xbg_cam_follow(&st,px,pz,frame,timing_clock()*1e-9,want,wx,wz,mode_==2?1e9f:params.tau);   // 第一人称不自动跟随，见 nvn_mtl.m cam_build | first person does not follow, see nvn_mtl.m cam_build
+        // 原神式（宿主 dm_cam_style = 1，越肩档）：镜头被人物拖着走（xbg_cam_drag），不朝摇杆方向追；其余照旧
+        // Genshin style (host dm_cam_style = 1, over-the-shoulder): the camera is dragged along by the character (xbg_cam_drag) and does not chase the stick
+        // direction; everything else as before
+        const int style=mode_==1 && dm_cam_style?dm_cam_style():0;
+        // 第一人称不自动跟随，见 nvn_mtl.m cam_build | first person does not follow, see nvn_mtl.m cam_build
+        const double t0=st.t;const bool fresh=style==1?xbg_cam_drag(&st,px,pz,frame,timing_clock()*1e-9,params.dist,drag_k):xbg_cam_follow(&st,px,pz,frame,timing_clock()*1e-9,want,wx,wz,mode_==2?1e9f:params.tau);
         if(fresh && turn!=0){xbg_cam_turn(&st,turn);turned+=turn;}
+        // 原神式：放技能时人转过去对着目标，镜头跟着转（宿主 dm_cam_attack_dir：0.8 秒内、摇杆都没推时才有；玩家自己刚转过镜头就不动）
+        // Genshin style: casting a skill turns the character to face the target and the camera turns with it (host dm_cam_attack_dir: only within 0.8 s and
+        // with neither stick pushed; not while the player has just turned the camera)
+        if(fresh && style==1 && !st.hold && dm_cam_attack_dir){float ax=0,az=0;if(dm_cam_attack_dir(&ax,&az))xbg_cam_ease(&st,ax,az,t0?st.t-t0:0,params.tau);}
         // 避墙（越肩档）：宿主按碰撞格量的、镜头朝后那个方向上离墙多远，每帧拉一次
         // Wall avoidance (over-the-shoulder mode): how far the wall is in the camera's backward direction, as the host measured on the collision grid, pulled once per frame
-        if(fresh && mode_==1){float c=0;clear_ok=dm_cam_clearance && dm_cam_clearance(-st.fx,-st.fz,&c,&host_px,&host_pz);clear=clear_ok?c:0;xbg_cam_pull(&st,params.dist,clear,t0?st.t-t0:0);}
+        // 原神式只理会离人近的墙（DM_CAM_PULL_NEAR，缺省 10）：镜头在人后 20、高 13，视线在人后 d 处离地约 3 + d / 2，再远的墙一般在视线下面、挡不住人。
+        // near 到 near + blend 之间从 near 渐变到满距离，越过门槛时不一下跳 10 个单位（用户 2026-10-29：避墙太敏感）
+        // The Genshin style only minds walls close to the character (DM_CAM_PULL_NEAR, default 10): with the camera 20 behind and 13 up, the sight line d
+        // behind the character is about 3 + d / 2 above the ground, so farther walls are usually below it and do not hide the character. Between near and
+        // near + blend the distance goes from near to the full distance, so crossing the threshold does not jump 10 units (the user, 2026-10-29: the wall
+        // avoidance reacts too easily)
+        if(fresh && mode_==1){float c=0;clear_ok=dm_cam_clearance && dm_cam_clearance(-st.fx,-st.fz,&c,&host_px,&host_pz);clear=clear_ok?c:0;
+            float want=clear;if(style==1 && want>0){if(want>=pull_near+pull_blend)want=0;else if(want>pull_near)want=pull_near+(params.dist-pull_near)*(want-pull_near)/pull_blend;if(want>0 && want<pull_min)want=pull_min;}
+            xbg_cam_pull(&st,params.dist,want,t0?st.t-t0:0);}
+        // 诊断：人物估计（xbg_cam_ground）和宿主读到的人物位置差 3 个单位以上就记一笔（最多每秒一次）——缩放算式不对、开面板时原版镜头横移，都会在这里露出来
+        // Diagnostic: log when the character estimate (xbg_cam_ground) is more than 3 units from the position the host reads (at most once a second) -- a
+        // wrong zoom formula or the original camera moving sideways for an open panel shows up here
+        if(fresh && clear_ok && hypotf(px-host_px,pz-host_pz)>3 && frame-drift_frame>60){drift_frame=frame;xbg_logf("NVN cam drift player=%.1f,%.1f host=%.1f,%.1f off=%.1f",px,pz,host_px,host_pz,hypotf(px-host_px,pz-host_pz));}
         // 玩家上下拖的俯仰（宿主 dm_cam.c）；算完把宿主的累计值夹回本帧机位能取的范围
         // The player's dragged pitch (host dm_cam.c); afterwards clamp the host's sum to this frame's range
-        st.tilt=dm_cam_tilt_get?dm_cam_tilt_get():0;
-        float vp[16],ivp[16];xbg_cam_build(&st,p,d,mode_,&params,vp,ivp);if(fresh && dm_cam_tilt_clamp)dm_cam_tilt_clamp(st.tilt_lo,st.tilt_hi);
+        // 原神式不调俯仰（触屏层也不再送）：以前拖过的俯仰也不用，固定在缺省机位
+        // The Genshin style has no pitch (the touch layer no longer sends it): an earlier dragged pitch is not used either, the default rig stays
+        st.tilt=style==1?0:dm_cam_tilt_get?dm_cam_tilt_get():0;
+        // 原神式：拉近时不超过 pull_pitch 度下俯、离人至少 pull_min（宁可镜头稍微进墙，也不贴在背上或变成头顶视角）
+        // Genshin style: when pulled in, no steeper than pull_pitch degrees and at least pull_min from the character (better slightly inside the wall than on
+        // the character's back or overhead)
+        xbg_cam_params rig=params;if(style==1)rig.pull_pitch=pull_pitch;
+        float vp[16],ivp[16];xbg_cam_build(&st,p,d,mode_,&rig,vp,ivp);if(fresh && dm_cam_tilt_clamp)dm_cam_tilt_clamp(st.tilt_lo,st.tilt_hi);
         if(dm_cam_publish)dm_cam_publish(reinterpret_cast<const float*>(p+336),reinterpret_cast<const float*>(p+400),vp,ivp,px,pz);
-        if(patches++%600==0)xbg_logf("NVN cam patch=%llu scene=%llu widened=%llu mode=%d bytes=%zu player=%.1f,%.1f heading=%.2f,%.2f eye=%.1f,%.1f,%.1f clear=%.1f(%d) dist=%.1f host=%.1f,%.1f turned=%.2f hold=%d",(unsigned long long)patches,(unsigned long long)scenes,(unsigned long long)widened,mode_,copy,px,pz,st.fx,st.fz,st.eye[0],st.eye[1],st.eye[2],clear,int(clear_ok),st.dcur,host_px,host_pz,turned,st.hold);
+        if(dm_cam_publish_height)dm_cam_publish_height(py);
+        if(patches++%600==0)xbg_logf("NVN cam patch=%llu scene=%llu widened=%llu mode=%d style=%d bytes=%zu player=%.1f,%.1f,%.1f heading=%.2f,%.2f eye=%.1f,%.1f,%.1f clear=%.1f(%d) dist=%.1f host=%.1f,%.1f turned=%.2f hold=%d ahead=%.0f,%.0f",(unsigned long long)patches,(unsigned long long)scenes,(unsigned long long)widened,mode_,style,copy,px,py,pz,st.fx,st.fz,st.eye[0],st.eye[1],st.eye[2],clear,int(clear_ok),st.dcur,host_px,host_pz,turned,st.hold,st.ahead[0],st.ahead[1]);
         if(patches==1){
             // 原版正交画面的大小（世界单位）：宽 2/pr[0]、高 2/pr[5]；原版下俯 30°，所以画面的高在地面上沿视线方向盖住两倍长。
             // 越肩镜头画得出来的东西不出这个范围：按正交视锥剔除的计算着色器和游戏自己挑单位都按它
@@ -2511,7 +2699,7 @@ Buffer patch(uint64_t address,size_t copy,const Buffer &src){
             // picture's height covers twice that length along the sight line. What the over-the-shoulder camera can draw stays inside this area: the compute
             // shader that culls against the orthographic frustum and the game's own choice of units both use it
             float pr[16];memcpy(pr,p+208,sizeof pr);
-            if(pr[0]!=0 && pr[5]!=0)xbg_logf("NVN cam original view=%.1fx%.1f ground=%.1fx%.1f (world units)",fabsf(2/pr[0]),fabsf(2/pr[5]),fabsf(2/pr[0]),fabsf(4/pr[5]));}
+            if(pr[0]!=0 && pr[5]!=0)xbg_logf("NVN cam original view=%.1fx%.1f ground=%.1fx%.1f (world units) axis offset=%.4f,%.4f",fabsf(2/pr[0]),fabsf(2/pr[5]),fabsf(2/pr[0]),fabsf(4/pr[5]),pr[12],pr[13]);}
     }else{xbg_cam_build10(&st,d);++scenes;}
     b.flush();Copy &c=copies[next++%copies.size()];c.address=address;c.bytes=copy;c.epoch=snapshot_epoch;c.buffer=b;return b;
 }

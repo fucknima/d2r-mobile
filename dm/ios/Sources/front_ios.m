@@ -134,12 +134,12 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
     int _navigation;
     CALayer *_mhPtr, *_thr[8];   // _thr：画面外怪物的指针（threatsSync） | _thr: pointers for monsters off the picture (threatsSync)
       // 镜头实验：小地图 / 全屏地图上人物朝向的指针（mapHeadingSync） | camera experiment: the facing pointer on the minimap / fullscreen map (mapHeadingSync)
-    CALayer *_mgLabel[12], *_mgMark[12];   // 小地图任务终点：每个终点一个名牌 / 符号层 + 一个灰十字层（mapGoalSync） | Minimap quest goals: one nameplate / symbol layer + one grey cross layer per goal (mapGoalSync)
+    CALayer *_mgLabel[DM_MAP_GOAL_MAX], *_mgMark[DM_MAP_GOAL_MAX];   // 小地图任务终点：每个终点一个名牌 / 符号层 + 一个灰十字层（mapGoalSync） | Minimap quest goals: one nameplate / symbol layer + one grey cross layer per goal (mapGoalSync)
     NSMutableDictionary<NSString *,UIImage *> *_mgImg;
     uint64_t _modifierPublishEndNS,_modifierPublishEpoch;
     uint64_t _touchEventSeq,_touchReceiptSeq,_touchPublishedEventSeq; // 仅 DM_TOUCH_CONTROL_LOG 开启时推进 | Advanced only when DM_TOUCH_CONTROL_LOG is on
     UITouch *_pendEnd; double _pendEndTime,_pendWall; BOOL _pendFire,_finalAsked;   // 松手了但宿主的答案还没回：这根手指的「抬起」先挂着（见 finishTouches） | Released but the host's answer is not back yet: this finger's "lift" is held pending (see finishTouches)
-    int32_t _minLeft,_maxLeft; uint64_t _lastButtons; unsigned _touchAPresses,_touchShots; UITouch *_uiFinger; CGPoint _uiFeO; BOOL _uiFeDrag; BOOL _uiDragOn; UITouch *_mapTouch, *_mapBackTouch, *_bindTouch; UIView *_ghostDim; BOOL _ghostOn; uint64_t _bindKey; uint32_t _selId; double _statNext; double _tipUntil, _addAt; unsigned _mapWorldSeq; BOOL _mapWorldAsked; CGPoint _mapWorldPt; CGPoint _mapP0, _bindP0; double _mapT0; BOOL _pulseTicking; uint64_t _pulseEpoch,_pulseS0; double _pulseT0,_pulseSeen,_pulseFree; unsigned _itemSeq,_relSeq; BOOL _relAsked,_itemAsked; int _itemKind;
+    int32_t _minLeft,_maxLeft; uint64_t _lastButtons; unsigned _touchAPresses,_touchShots; UITouch *_uiFinger; CGPoint _uiFeO; BOOL _uiFeDrag; BOOL _uiDragOn; UITouch *_mapTouch, *_bindTouch; UIView *_ghostDim; BOOL _ghostOn; uint64_t _bindKey; uint32_t _selId; double _statNext; double _tipUntil, _addAt; unsigned _mapWorldSeq; BOOL _mapWorldAsked; CGPoint _mapWorldPt; CGPoint _mapP0, _bindP0; double _mapT0; BOOL _pulseTicking; uint64_t _pulseEpoch,_pulseS0; double _pulseT0,_pulseSeen,_pulseFree; unsigned _itemSeq,_relSeq; BOOL _relAsked,_itemAsked; int _itemKind;
 }
 + (Class)layerClass { return CAMetalLayer.class; }
 - (instancetype)initWithFrame:(CGRect)f {
@@ -269,7 +269,7 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
     _pendEnd=nil; _finalAsked=NO;
     for(int i_=0;i_<16;i_++) _slot[i_]=nil; dm_tc_cancel_all(&_controls); [self pushFrom:source phase:"none"];
     if(_uiDragOn) { _uiDragOn=NO; dm_ui_drag_end(); }
-    _mapTouch=_mapBackTouch=_bindTouch=nil;
+    _mapTouch=_bindTouch=nil;
 }
 // 技能绑定入口（技能为空时一个单色十字，点击进入绑定技能）：游戏态下触点落在技能钮（主攻击大钮 A 与 F1–F4，含当前组）上——
 //   空位：这根手指不进手势层，点一下 = 给这个位选技能（dm_ui_bind_begin，宿主开技能树）；
@@ -406,21 +406,27 @@ static void restart_cover_hook(int on) { dispatch_async(dispatch_get_main_queue(
     CGPoint o; CGRect area;
     if(mode==2) { o=CGPointMake(wr.origin.x+v.sx*wr.size.width, wr.origin.y+v.sy*wr.size.height); area=CGRectMake(wr.origin.x+wr.size.width*0.04, wr.origin.y+H*0.06, wr.size.width*0.92, H*0.72); }
     else { area=CGRectMake(mm[0]*z.width, mm[1]*z.height, (mm[2]-mm[0])*z.width, (mm[3]-mm[1])*z.height); o=CGPointMake(CGRectGetMidX(area),CGRectGetMidY(area)); area=CGRectInset(area,area.size.width*0.06,area.size.height*0.08); }
-    for(int i=0;i<12;i++) {
+    CGRect placed[DM_MAP_GOAL_MAX]; int np=0;   // 已画名牌的矩形：后画的和它们重叠就往下挪一个名牌高（遗忘之塔一层两个出口在同一间房里） | rects of plates already drawn: a later plate overlapping them moves down by one plate height (Forgotten Tower level 1 has both exits in one room)
+    for(int i=0;i<DM_MAP_GOAL_MAX;i++) {
         if(!_mgLabel[i]) { _mgLabel[i]=[CALayer layer]; _mgMark[i]=[CALayer layer]; for(CALayer *l in @[_mgLabel[i],_mgMark[i]]) { l.contentsGravity=kCAGravityResizeAspect; l.hidden=YES; [_info.layer addSublayer:l]; } }
         if(!show || i>=n) { _mgLabel[i].hidden=YES; _mgMark[i].hidden=YES; continue; }
         int dx=v.x[i]-v.px, dy=v.y[i]-v.py; CGPoint p=CGPointMake(o.x+(dx-dy)*1.6*c, o.y+(dx+dy)*0.8*c);
+        if(v.art[i]>=DM_MG_WP && dx*dx+dy*dy<144) { _mgLabel[i].hidden=YES; _mgMark[i].hidden=YES; continue; }   // 人已在这个入口 / 传送点 12 格内：不画（压在人物脚下，游戏自己有悬停名字） | the player is within 12 cells of this entrance / waypoint: not drawn (it would sit under the character's feet, and the game shows its own hover name)
         BOOL inside=CGRectContainsPoint(area,p) && !(mode==2 && p.x>wr.origin.x+wr.size.width*0.72 && p.y>wr.origin.y+H*0.45);   // 全屏地图右下是技能区 | The bottom right of the fullscreen map is the skill area
-        int art=v.art[i], sym=art>=64; UIImage *lab=nil, *mark=nil;
+        int art=v.art[i], sym=art>=64 && art<DM_MG_WP; UIImage *lab=nil, *mark=nil;
+        NSString *base=art>=DM_MG_LVL ? [NSString stringWithFormat:@"lvl_%d",art-DM_MG_LVL] : art==DM_MG_WP ? @"lvl_wp" : [NSString stringWithFormat:@"label_%d",sym ? 0 : art];   // 任务名牌 label_<序号>；出入口写通向的区域名 lvl_<区域号>、传送点 lvl_wp（宿主 dm_world.c 出入口名牌） | quest nameplate label_<index>; entrances show the target level name lvl_<level id>, waypoints lvl_wp (host dm_world.c entrance nameplates)
         if(inside && sym) mark=[self mgImage:[NSString stringWithFormat:@"sym_%d.png",art-64]];
-        else { int id=sym ? 0 : art; int lg=dm_lang_group(); lab=lg!=DM_LG_ZH ? [self mgImage:[NSString stringWithFormat:@"label_%d_%s.png",id,lg==DM_LG_ES?"es":lg==DM_LG_MX?"mx":lg==DM_LG_RU?"ru":lg==DM_LG_KO?"ko":"en"]] : (old && dm_lang_index()==8 ? [self mgImage:[NSString stringWithFormat:@"label_%d_old.png",id]] : nil);   // 简中 / 繁体用中文，西语用原版 esES / esMX 名字，俄语用原版 ruRU 名字，其余英文名牌，其余原版 enUS 名牌；旧译名只跟简中（注释一系只写 zhCN） | Simplified / Traditional Chinese use Chinese, Spanish uses the original esES / esMX names, Russian uses the original ruRU names, everything else the original enUS name plates; old names follow only Simplified Chinese (the annotation family writes only zhCN)
-            lab=lab ?: [self mgImage:[NSString stringWithFormat:@"label_%d.png",id]]; if(inside) mark=[self mgImage:@"cross.png"]; }
+        else { int lg=dm_lang_group(); lab=lg!=DM_LG_ZH ? [self mgImage:[NSString stringWithFormat:@"%@_%s.png",base,lg==DM_LG_ES?"es":lg==DM_LG_MX?"mx":lg==DM_LG_RU?"ru":lg==DM_LG_KO?"ko":"en"]] : (old && dm_lang_index()==8 ? [self mgImage:[base stringByAppendingString:@"_old.png"]] : nil);   // 简中 / 繁体用中文，西语用原版 esES / esMX 名字，俄语用原版 ruRU 名字，其余英文名牌，其余原版 enUS 名牌；旧译名只跟简中（注释一系只写 zhCN） | Simplified / Traditional Chinese use Chinese, Spanish uses the original esES / esMX names, Russian uses the original ruRU names, everything else the original enUS name plates; old names follow only Simplified Chinese (the annotation family writes only zhCN)
+            lab=lab ?: [self mgImage:[base stringByAppendingString:@".png"]]; if(inside) mark=[self mgImage:@"cross.png"]; }
         if(!inside) {   // 画面外：沿 玩家点 → 终点 的方向收到可见范围边上（全屏地图再让开右下技能区），只写名字 | Off-screen: clamp along the player point → goal direction to the edge of the visible range (the fullscreen map additionally avoids the bottom-right skill area), name only
             CGFloat tx=p.x>o.x ? (CGRectGetMaxX(area)-o.x)/(p.x-o.x) : p.x<o.x ? (CGRectGetMinX(area)-o.x)/(p.x-o.x) : 1e9, ty=p.y>o.y ? (CGRectGetMaxY(area)-o.y)/(p.y-o.y) : p.y<o.y ? (CGRectGetMinY(area)-o.y)/(p.y-o.y) : 1e9, t=MIN(tx,ty);
             p=CGPointMake(o.x+(p.x-o.x)*t, o.y+(p.y-o.y)*t);
             if(mode==2 && p.x>wr.origin.x+wr.size.width*0.72 && p.y>wr.origin.y+H*0.45) p.y=wr.origin.y+H*0.45; }
         CGFloat lw=lab ? lh*lab.size.width/lab.size.height : 0, cw=lh*1.4, ch=cw*18/34;
-        if(lab) { _mgLabel[i].contents=(id)lab.CGImage; _mgLabel[i].frame=CGRectMake(p.x-lw/2, (mark ? p.y-ch/2-2-lh : p.y-lh/2), lw, lh); _mgLabel[i].hidden=NO; } else _mgLabel[i].hidden=YES;
+        if(lab) { CGRect lr=CGRectMake(p.x-lw/2, (mark ? p.y-ch/2-2-lh : p.y-lh/2), lw, lh), occ=mark ? CGRectMake(lr.origin.x, lr.origin.y, lw, lh+2+ch) : lr; CGFloat sh0=0;   // 占地 = 名牌连下面的十字 | footprint = the plate plus the cross under it
+            for(int k=0;k<np;k++) if(CGRectIntersectsRect(CGRectOffset(occ,0,sh0),placed[k])) { sh0=CGRectGetMaxY(placed[k])+1-occ.origin.y; k=-1; }   // 和已画的重叠：挪到它下面，再从头核一遍 | overlaps one already drawn: move below it and check all again
+            lr=CGRectOffset(lr,0,sh0); p.y+=sh0; if(np<DM_MAP_GOAL_MAX) placed[np++]=CGRectOffset(occ,0,sh0);
+            _mgLabel[i].contents=(id)lab.CGImage; _mgLabel[i].frame=lr; _mgLabel[i].hidden=NO; } else _mgLabel[i].hidden=YES;
         if(mark) { CGFloat mw=sym ? sh*mark.size.width/mark.size.height : cw, mh=sym ? sh : ch; _mgMark[i].contents=(id)mark.CGImage; _mgMark[i].frame=CGRectMake(p.x-mw/2, p.y-mh/2, mw, mh); _mgMark[i].hidden=NO; } else _mgMark[i].hidden=YES;
     }
     [CATransaction commit];
@@ -554,7 +560,6 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
         if(_uiDragOn && _controls.pointer_slot==i) { _uiDragOn=NO; dm_ui_drag_end(); }
         dm_tc_cancel_finger(&_controls,i); _slot[i]=nil; }
     if(_mapTouch && touch_done(_mapTouch)) { LOG("前端：【红】清理残留触摸（小地图那根）"); _mapTouch=nil; }
-    if(_mapBackTouch && touch_done(_mapBackTouch)) { LOG("前端：【红】清理残留触摸（全屏地图那根）"); _mapBackTouch=nil; }
     if(_bindTouch && touch_done(_bindTouch)) { LOG("前端：【红】清理残留触摸（空技能位那根）"); _bindTouch=nil; }
     if(_uiFinger && touch_done(_uiFinger)) { LOG("前端：【红】清理残留触摸（界面手指）"); _uiFinger=nil;   // 宿主那头一并收：在拖就结束滚动拖，否则作废这次界面点击（相 3 清 g_ut_phase / 删除长按） | Clean up on the host side too: if dragging, end the scroll drag; otherwise void this UI click (phase 3 clears g_ut_phase / removes the long press)
         if(_uiFeDrag||_uiDragOn) { _uiFeDrag=NO; _uiDragOn=NO; dm_ui_drag_end(); } else dm_ui_touch(3,0,0); }
@@ -582,9 +587,8 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
         if(!_mapTouch && [self inMinimap:[t locationInView:self]]) { _mapTouch=t; _mapP0=[t locationInView:self]; _mapT0=CACurrentMediaTime(); continue; }
         for(int i=0;i<16;i++) if(!_slot[i]) {
             _slot[i]=t; CGPoint p=[t locationInView:self]; { int ex=0; _controls.belt_rows=dm_belt_rows(&ex); _controls.belt_open=ex; } { int dm_cam_mode(void); _controls.cam_on=dm_cam_mode(); } dm_tc_begin_at(&_controls,i,p.x,p.y,CACurrentMediaTime()); slot=i;
-            if(!_navigation && _controls.finger[i].target==DM_TC_PORTAL) { void dm_tp_request(void); dm_tp_request(); LOG("前端：点回城钮 → 免费回城"); }
-            if(!_navigation && _controls.finger[i].target==DM_TC_REFILL) { void dm_cheats_pulse(void); dm_cheats_pulse(); LOG("前端：点满血钮 → 下一拍补满"); }   // 宿主 dm_cheats.c，下一拍写满血蓝耐 | host dm_cheats.c fills life/mana/stamina on the next tick   // 不要回城书 / 卷轴（宿主 dm_freetp.c） | No Tome of Town Portal / scroll needed (host dm_freetp.c)
-            if(!_navigation && !_mapBackTouch && _controls.finger[i].target==DM_TC_NONE && dm_ui_map_is_full()) { _mapBackTouch=t; _mapP0=p; _mapT0=CACurrentMediaTime(); }   // 全屏地图开着、这根手指没落在任何键和摇杆区上：松手时若是点按就回小地图 | Fullscreen map open and this finger landed on no button and no stick area: if it turns out to be a tap on release, return to the minimap
+            if(!_navigation && _controls.finger[i].target==DM_TC_PORTAL) { void dm_tp_request(void); dm_tp_request(); LOG("前端：点回城钮 → 免费回城"); }   // 不要回城书 / 卷轴（宿主 dm_freetp.c） | No Tome of Town Portal / scroll needed (host dm_freetp.c)
+            if(!_navigation && _controls.finger[i].target==DM_TC_REFILL) { void dm_cheats_pulse(void); dm_cheats_pulse(); LOG("前端：点满血钮 → 下一拍补满"); }   // 宿主 dm_cheats.c，下一拍写满血蓝耐 | host dm_cheats.c fills life/mana/stamina on the next tick
             // 功能页里的指针手指：问宿主这点是不是物品区（游戏主线程下一帧作答，松手时取）
             // Pointer finger in a function page: ask the host whether this point is an item area (the game main thread answers on the next frame; fetched on release)
             if(_controls.navigation_mode && _controls.pointer_slot==i && self.bounds.size.width>0) _itemSeq=dm_ui_item_query((float)(p.x/self.bounds.size.width),(float)(p.y/self.bounds.size.height)); _itemAsked=YES; _itemKind=-1;
@@ -659,8 +663,6 @@ static BOOL touch_done(UITouch *t) { UITouchPhase ph=t.phase; return ph==UITouch
         if(t==_bindTouch) { CGPoint p=[t locationInView:self]; _bindTouch=nil;
             if(!strcmp(phase,"ended") && !_navigation && hypot(p.x-_bindP0.x,p.y-_bindP0.y)<=14) { dm_ui_bind_begin(_bindKey); LOG("前端：点空技能位 (%.0f,%.0f) → 给键 %#llx 选技能",p.x,p.y,(unsigned long long)_bindKey); }
             continue; }
-        if(t==_mapBackTouch) { CGPoint p=[t locationInView:self]; _mapBackTouch=nil;
-            if(!strcmp(phase,"ended") && !_navigation && dm_ui_map_is_full() && hypot(p.x-_mapP0.x,p.y-_mapP0.y)<=14 && CACurrentMediaTime()-_mapT0<0.6) { dm_ui_map_full(0); LOG("前端：全屏地图开着，点空处 (%.0f,%.0f) → 回小地图",p.x,p.y); } }
         // 松手时宿主的答案还没回就先不结束这根手指（外部 PR 指出，自己实现）：
         //   · 判类没回：原先按「别处」当鼠标点击处理，落在货架上会走到原版的价格确认；
         //   · 拖放：原先用最后一次「移动」时问的落点，快松手时那是上一个位置（一步拖过去马上松手，丢成了放回）——按松手这一刻的位置再问一次并等答案。
