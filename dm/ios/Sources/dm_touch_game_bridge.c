@@ -77,7 +77,8 @@ static int skill_live(const unsigned char *b,uint32_t id,int32_t item) {
         int lv=*(int32_t*)(n+0x38); if(item==-1)lv+=((int(*)(uint64_t,uint64_t,int))(b+0x5b1710))(pl,n,0);
         int cap=**(int32_t**)(*(uint64_t*)(b+0x2d64a18+(uint64_t)ver*16)+0x1500); if(lv<0)lv=0; if(lv>cap)lv=cap;
         return lv>0; }
-    { int dm_swapskill_equipped(int32_t); return item!=-1 && dm_swapskill_equipped(item); }   /* 副手组技能：物品还穿在换手那组上 = 按下会先换武器再放（dm_actions.c），照常显示、角标「II」 | Off-hand set skill: the item is still worn on the weapon-swap set = pressing will swap weapons first and then cast (dm_actions.c); shown as usual, with corner badge "II" */
+    /* 战争召唤这类（物品 -1）：换手那组给 = 按下会先换武器再放，照常显示 | Call to Arms style (item -1): granted by the swap set = a press swaps weapons first, shown as usual */
+    { int dm_swapskill_equipped(int32_t),dm_swapskill_offhand_gives(int); return item!=-1 ? dm_swapskill_equipped(item) : dm_swapskill_offhand_gives((int)id); }   /* 副手组技能：物品还穿在换手那组上 = 按下会先换武器再放（dm_actions.c），照常显示、角标「II」 | Off-hand set skill: the item is still worn on the weapon-swap set = pressing will swap weapons first and then cast (dm_actions.c); shown as usual, with corner badge "II" */
 }
 static void binding_getter(const uint64_t *regs) {
     const module_t *m=main_module;
@@ -88,10 +89,16 @@ static void binding_getter(const uint64_t *regs) {
     if(input_slot>=DM_TG_SLOTS || effective>=28 || effective<input_slot){dg[2]++;return;}
     uint64_t selected_bank=effective-input_slot;
     if(selected_bank!=0 && selected_bank!=16){dg[3]++;return;}
-    unsigned dead=0;   /* 绑着但玩家现在没有的技能（位 = 槽）。要调游戏函数，放在取锁之前 | Skills that are bound but the player does not currently have (bit = slot). This calls a game function, so it is placed before taking the lock */
-    for(int i=0;live_check && i<DM_TG_SLOTS;i++) { uint32_t id;int32_t item;const unsigned char *e=(const unsigned char*)m->base+BINDING_OFFSET+(selected_bank+i)*DM_TG_STRIDE;memcpy(&id,e,4);memcpy(&item,e+4,4);
+#ifndef DM_TG_TEST_SYNTHETIC_IDENTITY
+    if(regs[23]!=regs[19]) {dg[5]++;dg_id[4]++;return;}   /* 不是 HUD updater（见下面同一判定的说明）：先筛掉，免得每次调用都去查 16 个槽（Time Profiler：混战里占游戏主线程三成） | not the HUD updater (see the same check below): filter first, so not every call checks 16 slots (Time Profiler: a third of the game main thread in heavy fights) */
+#endif
+    /* 绑着但玩家现在没有的技能（位 = 槽）。要调游戏函数，放在取锁之前；只随换装备变，每组 0.2 秒查一次 | Skills that are bound but the player does not currently have (bit = slot). This calls a game function, so it is placed before taking the lock; it only changes with gear, checked once per 0.2 s per bank */
+    static unsigned dead_c[2]; static uint64_t dead_at[2]; uint64_t tn=now_ns(); int bk=selected_bank!=0;
+    unsigned dead=dead_c[bk]; int recheck=live_check && tn-dead_at[bk]>=200000000ull; if(recheck) { dead=0; dead_at[bk]=tn; }
+    for(int i=0;recheck && i<DM_TG_SLOTS;i++) { uint32_t id;int32_t item;const unsigned char *e=(const unsigned char*)m->base+BINDING_OFFSET+(selected_bank+i)*DM_TG_STRIDE;memcpy(&id,e,4);memcpy(&item,e+4,4);
         static uint32_t gone[32]; int live=skill_live((const unsigned char*)m->base,id,item); if(!live)dead|=1u<<i;
         if(gone[selected_bank+i]!=(live?UINT32_MAX:id)) { gone[selected_bank+i]=live?UINT32_MAX:id; if(!live)LOG("技能钮：槽 %d 绑的技能 %u（物品 %d）玩家现在没有，按空位显示",(int)selected_bank+i,id,item); else LOG("技能钮：槽 %d 的技能回来了，照常显示",(int)selected_bank+i); } }
+    if(recheck) dead_c[bk]=dead;
     pthread_mutex_lock(&lock);
     if(!scene_game || !world_epoch) {dg[4]++;pthread_mutex_unlock(&lock);return;} // menu/nav不学cohort。 | menu/nav do not learn the cohort.
     uint64_t caller=0,hud=0;

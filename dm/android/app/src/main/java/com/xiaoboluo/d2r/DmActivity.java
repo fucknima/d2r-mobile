@@ -30,6 +30,7 @@ import android.view.WindowInsets;
 import android.view.WindowInsetsController;
 import android.view.WindowManager;
 import android.widget.TextView;
+import android.widget.Toast;
 import android.widget.EditText;
 import android.widget.FrameLayout;
 import java.io.File;
@@ -41,7 +42,12 @@ import java.io.OutputStream;
 import java.lang.ref.WeakReference;
 import java.nio.charset.StandardCharsets;
 import java.nio.file.Files;
+import java.text.SimpleDateFormat;
+import java.util.ArrayList;
+import java.util.Arrays;
+import java.util.Date;
 import java.util.HashSet;
+import java.util.List;
 import java.util.Locale;
 import java.util.Set;
 
@@ -84,7 +90,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     private FrameLayout gameFrame;
     private TouchOverlay touchOverlay;
     private boolean started;
-    private boolean importing;
+    private boolean importing, savesTransferred;
     private boolean libraryLoaded;
     private boolean resumed;
     private DisplayManager displays;
@@ -123,13 +129,18 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // 手柄事件在这里吃掉，不再往下传给视图（否则会触发触摸控件、系统返回等）。
     // Physical controller: keys and sticks are merged in PadInput into the host controller state (nativePad -> dm_pad_set), combined with
     // the touch stick when the game reads the controller. Controller events are consumed here and not passed on to the views.
+    // 原生库载入之前（导入进度页、「导入包版本不对」等启动错误页）手柄事件不进 PadInput：它要调原生方法，库还没载入就是
+    // UnsatisfiedLinkError，App 直接闪退（#178：装好新版、导入之前连上手柄就闪退）。这时交给系统，照普通界面处理
+    // Before the native library is loaded (the import progress page, start errors such as "the import pack is for another version"), controller
+    // events do not go to PadInput: it calls native methods, which throw UnsatisfiedLinkError while the library is not loaded and kill the app
+    // (#178: connecting a controller after installing a new version, before the import, crashed it). The system handles them as on any other screen
     @Override public boolean dispatchKeyEvent(KeyEvent e) {
-        if (PadInput.onKey(e)) return true;
+        if (libraryLoaded && PadInput.onKey(e)) return true;
         return super.dispatchKeyEvent(e);
     }
 
     @Override public boolean onGenericMotionEvent(MotionEvent e) {
-        if (PadInput.onMotion(e)) return true;
+        if (libraryLoaded && PadInput.onMotion(e)) return true;
         return super.onGenericMotionEvent(e);
     }
 
@@ -189,6 +200,11 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
     // pack_info.txt last: if the app is killed or runs out of space, the next start imports again and half a copy is never used.
     // Done before the native library loads: in the release APK without game content, a few tables are read from derived.tsv at load time.
     private static final String[] IMPORT_ITEMS = {"out", "shaders", "overlay", "derived.tsv", "pack_info.txt"};
+    // 可有可无的导入项：走覆盖层的自定义开关的各组合（物品注释与旧译名，#191；jni_android.c 启动时按开关挑一份）。
+    // 旧导入包没有它，照常导入；新导入包没有它时，旧的那份删掉
+    // Optional import items: the overlays for custom switches that go through the overlay (item notes and old names, #191; jni_android.c picks one at start).
+    // Older import packs lack it and still import; when a new import pack lacks it, the old copy is removed
+    private static final String[] OPTIONAL_ITEMS = {"overlay_variants"};
 
     private static String readText(File f) {
         try { return new String(Files.readAllBytes(f.toPath()), StandardCharsets.UTF_8); } catch (IOException e) { return null; }
@@ -237,23 +253,26 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
 
     private static void importPack(File source, File runtime, Progress progress) throws IOException {
         for (String item : IMPORT_ITEMS) if (!new File(source, item).exists()) throw new IOException("missing " + item);
+        List<String> items = new ArrayList<>(Arrays.asList(IMPORT_ITEMS));
+        for (String item : OPTIONAL_ITEMS) if (new File(source, item).exists()) items.add(item);
         File part = new File(runtime, "import.part");
         deleteTree(part);
         long sum = 0;
-        for (String item : IMPORT_ITEMS) sum += treeSize(new File(source, item));
+        for (String item : items) sum += treeSize(new File(source, item));
         final long total = sum;
         long[] done = {0}; int[] shown = {-1};
         byte[] buffer = new byte[1 << 20];
-        for (String item : IMPORT_ITEMS) copyTree(new File(source, item), new File(part, item), buffer, bytes -> {
+        for (String item : items) copyTree(new File(source, item), new File(part, item), buffer, bytes -> {
             done[0] += bytes;
             int p = (int) (done[0] * 100 / Math.max(1, total));
             if (p != shown[0]) { shown[0] = p; progress.percent(p); }
         });
-        for (String item : IMPORT_ITEMS) {
+        for (String item : items) {
             File from = new File(part, item), to = new File(runtime, item);
             deleteTree(to);
             if (!from.renameTo(to)) throw new IOException("rename " + item);
         }
+        for (String item : OPTIONAL_ITEMS) if (!items.contains(item)) deleteTree(new File(runtime, item));
         deleteTree(part);
     }
 
@@ -287,10 +306,33 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
         if (f.exists() && !f.delete()) throw new IOException("delete " + f.getName());
     }
 
+    // 存档导出 / 导入（SaveTransfer）：游戏文件夹里放了 export 记号或 save-import 文件夹时，在原生库加载之前、每个进程做一次，结果用一条提示告诉玩家
+    // Save export / import (SaveTransfer): with an export marker or a save-import folder in the game folder, done once per process before the native
+    // library loads, and the result is told to the player in a toast
+    private void transferSaves(File game) {
+        String stamp = new SimpleDateFormat("yyyyMMdd-HHmmss", Locale.US).format(new Date());
+        for (SaveTransfer.Result r : SaveTransfer.run(game, new File(getFilesDir(), "save"), stamp)) {
+            String where = r.path == null ? null : "Download/S2X/D2R Mobile/" + r.path;
+            String text = switch (r.kind) {
+                case SaveTransfer.EXPORTED -> getString(R.string.dmAndroidSaveExported, where);
+                case SaveTransfer.EXPORT_EMPTY -> getString(R.string.dmAndroidSaveExportEmpty);
+                case SaveTransfer.IMPORTED -> r.path == null ? (r.skipped == null ? null : getString(R.string.dmAndroidSaveImportNothing, r.skipped))
+                    : r.skipped == null ? getString(R.string.dmAndroidSaveImported, r.path) : getString(R.string.dmAndroidSaveImportedSome, r.path, r.skipped);
+                case SaveTransfer.IMPORT_REJECTED -> getString(R.string.dmAndroidSaveImportRejected, r.path);
+                default -> getString(R.string.dmAndroidSaveTransferFailed, r.path);
+            };
+            android.util.Log.i("dm", "存档导出 / 导入：结果 " + r.kind + "，" + r.path + (r.skipped == null ? "" : "，已有没导：" + r.skipped) + (r.merge == SaveTransfer.MERGE_NONE ? "" : "，共享仓库并回 " + r.merge));
+            if (text != null) Toast.makeText(this, text, Toast.LENGTH_LONG).show();
+            if (r.merge != SaveTransfer.MERGE_NONE)
+                Toast.makeText(this, getString(r.merge == SaveTransfer.MERGE_QUEUED ? R.string.dmAndroidSaveStashMerge : r.merge == SaveTransfer.MERGE_ALREADY ? R.string.dmAndroidSaveStashMerged : R.string.dmAndroidSaveStashSamePhone), Toast.LENGTH_LONG).show();
+        }
+    }
+
     private void startHost() {
         if (bootFailure != 0) { showBootFailure(); return; }
         if (started || importing || !resumed || !ensureFileAccess()) return;
         File downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS);
+        if (!libraryLoaded && !savesTransferred) { savesTransferred = true; transferSaves(new File(downloads, "S2X/D2R Mobile")); }
         if (!libraryLoaded && !ensureImported(new File(downloads, "S2X/D2R Mobile/android"))) return;
         if (gameFrame.getParent() == null) setContentView(gameFrame);
         if (!libraryLoaded) {
@@ -316,6 +358,7 @@ public class DmActivity extends Activity implements SurfaceHolder.Callback, Disp
                 touchOverlay.setSafeInsets(safe.left, safe.right, safe.bottom);
                 return insets;
             });
+            if (BuildConfig.DEBUG && getIntent().getBooleanExtra("dmNoHud", false)) touchOverlay.setDebugNoHud(true);   // 调试包：量游戏自己的 HUD 时不画自绘层 | debug builds: no overlay drawing while measuring the game's own HUD
             gameFrame.addView(touchOverlay, new FrameLayout.LayoutParams(-1, -1));
             touchOverlay.requestApplyInsets();
         }

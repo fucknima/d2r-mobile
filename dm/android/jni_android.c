@@ -151,6 +151,47 @@ static void load_env_file(const char *dir) {
     fclose(fp);
 }
 
+// 走覆盖层的自定义开关（物品注释与旧译名，#191）：打包时 gen_romfs_overlay.py 在 overlay 旁边出了各开关组合的完整覆盖层
+// overlay_variants/<键+键…>（d2rm_android.py 带进导入包）。照 iOS main.m：挑键集合与开着的开关正好相等的那份，核过它自己的清单，
+// 写成「变体:overlay」返回 1——DM_ROMFS_OVERLAY 可以有多层、前面优先：游戏数据用变体那份，触屏素材只在 overlay 里、照常找到。
+// 全关、没有变体目录、没有对应组合或清单不对：返回 0，用 overlay。重启后生效（同 iOS）
+// Custom switches that go through the overlay (item notes and old translated names, #191): at pack time gen_romfs_overlay.py writes a complete overlay per
+// switch combination next to overlay, overlay_variants/<key+key...> (d2rm_android.py puts it in the import pack). As in iOS main.m: pick the one whose key
+// set equals the switches that are on, check its own manifest, write "variant:overlay" and return 1 -- DM_ROMFS_OVERLAY may have layers, earlier first: the
+// game data comes from the variant, the touch art exists only in overlay and is found as usual. Everything off, no variants directory, no matching
+// combination or a bad manifest: return 0 and use overlay. Takes effect after a restart (as on iOS)
+int dm_custom_get(const char *key); void dm_custom_init(const char *dir);
+static int overlay_variant(const char *overlay, char *out, size_t n) {
+    char vdir[1300]; snprintf(vdir, sizeof vdir, "%s_variants", overlay);
+    DIR *d = opendir(vdir); if (!d) return 0;
+    char names[16][64]; int nv = 0; struct dirent *e;
+    while ((e = readdir(d)) && nv < 16) if (e->d_name[0] != '.' && strlen(e->d_name) < sizeof names[0]) strlcpy(names[nv++], e->d_name, sizeof names[0]);
+    closedir(d);
+    // 开关存在存档目录旁的 sw_custom.txt（dm_custom.c）；宿主起来、存档挂上之前就要读，先告诉它在哪（iOS 同样在启动时给）
+    // The switches live in sw_custom.txt next to the save directory (dm_custom.c); they are read before the host starts and the save is mounted, so tell it where first (iOS does the same at boot)
+    const char *sv = getenv("DM_SAVE"); char sd[1100]; strlcpy(sd, sv ? sv : g_files, sizeof sd);
+    char *sl = strrchr(sd, '/'); if (sl) *sl = 0;
+    dm_custom_init(sd);
+    // 变体名里出现过的键（去重）里开着几个；某份变体的键全开、个数又相等 = 键集合正好相等
+    // How many of the keys named by the variants (deduplicated) are on; a variant whose keys are all on and whose key count is the same = an exact match
+    char keys[16][64]; int nk = 0, on = 0;
+    for (int i = 0; i < nv; i++) { char t[64], *sp = NULL; strlcpy(t, names[i], sizeof t);
+        for (char *k = strtok_r(t, "+", &sp); k; k = strtok_r(NULL, "+", &sp)) {
+            int seen = 0; for (int j = 0; j < nk; j++) seen |= !strcmp(keys[j], k);
+            if (!seen && nk < 16) { strlcpy(keys[nk++], k, sizeof keys[0]); on += dm_custom_get(k) != 0; } } }
+    if (!on) { LOG("boot: 覆盖层变体 %d 份，开关都关着，用 overlay", nv); return 0; }
+    for (int i = 0; i < nv; i++) { char t[64], *sp = NULL; int cnt = 0, all = 1; strlcpy(t, names[i], sizeof t);
+        for (char *k = strtok_r(t, "+", &sp); k; k = strtok_r(NULL, "+", &sp)) { cnt++; all &= dm_custom_get(k) != 0; }
+        if (!all || cnt != on) continue;
+        char path[1400], reason[256]; snprintf(path, sizeof path, "%s/%s", vdir, names[i]);
+        dm_overlay_result r = dm_overlay_validate(path, DM_OVERLAY_SOURCE_SHA256, reason, sizeof reason);
+        if (r != DM_OVERLAY_OK) { LOG("boot: 【红】覆盖层变体 %s 不能用（%d：%s），按开关全关启动", names[i], r, reason); return 0; }
+        if (snprintf(out, n, "%s:%s", path, overlay) >= (int)n) return 0;
+        LOG("boot: 覆盖层变体 %s（开关开着，叠在 overlay 前面）", names[i]); return 1; }
+    LOG("boot: 【红】开着的 %d 个覆盖层开关没有对应的变体，按开关全关启动", on);
+    return 0;
+}
+
 JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env, jclass cls, jstring files, jstring ext, jstring src, jstring lang) {
     (void)cls;
     static int started; if (started) return 0;
@@ -186,12 +227,14 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
     // A draw whose pipeline state equals the previous draw's reuses its pipeline without serializing the create info for a
     // lookup (the engine's gfx-pipe-memo; a marker file still wins).
     setenv("DM_GFX_PIPE_MEMO", "1", 0);
-    // 3D 渲染比例上限 0.85（其他手机平台缺省 0.75，见 hle_oe.c；env 文件仍优先）：Redmi K50 Ultra 营地和 9 分钟战斗都稳 60 帧，比 0.75
-    // 多 28% 像素，打 9 分钟多热约 2 °C；重场景或机身过热掉帧时，动态比例每次退 0.05。
-    // 3D render scale ceiling 0.85 (other phone platforms default to 0.75, see hle_oe.c; the env file still wins): on the Redmi K50
-    // Ultra the camp and a 9-minute fight hold 60 fps with 28% more pixels than 0.75 and about 2 C more heat; when heavy scenes or
-    // a hot phone drop frames, the dynamic scale steps down 0.05 at a time.
-    setenv("DM_3D_SCALE", "0.85", 0);
+    // 3D 渲染比例缺省 0.85，即自定义页「3D 清晰度」的「均衡」档（其他手机平台缺省 0.75；省电 0.60、清晰 1.00，见 hle_oe.c）：Redmi K50 Ultra
+    // 营地和 9 分钟战斗都稳 60 帧，比 0.75 多 28% 像素，打 9 分钟多热约 2 °C；重场景或机身过热掉帧时，动态比例每次退 0.05。
+    // 给的是缺省、不是 DM_3D_SCALE：玩家在自定义页选的档照样生效；env 文件里的 DM_3D_SCALE 仍把比例钉住（测试、测量）。
+    // 3D render scale default 0.85, the "balanced" level of the Custom page's "3D resolution" (other phone platforms default to 0.75; power saver 0.60,
+    // sharp 1.00, see hle_oe.c): on the Redmi K50 Ultra the camp and a 9-minute fight hold 60 fps with 28% more pixels than 0.75 and about 2 C more heat;
+    // when heavy scenes or a hot phone drop frames, the dynamic scale steps down 0.05 at a time. This sets the default, not DM_3D_SCALE, so the level the
+    // player picks on the Custom page takes effect; DM_3D_SCALE in the env file still pins the scale (tests, measurements).
+    setenv("DM_3D_SCALE_DEFAULT", "0.85", 0);
     // Vulkan 适配器先沿用同步提交；上游新增翻译线程需独立验证对象生命周期。
     // Keep synchronous submission until the new upstream translation thread's object lifetimes are verified with Vulkan.
     setenv("DM_NVN_SYNC", "1", 0);
@@ -309,7 +352,8 @@ JNIEXPORT jint JNICALL Java_com_xiaoboluo_d2r_DmActivity_nativeStart(JNIEnv *env
         return overlay == DM_OVERLAY_MISSING ? -9 : -10;
     }
     LOG("boot: overlay verified source=%s", DM_OVERLAY_SOURCE_SHA256);
-    setenv("DM_ROMFS_OVERLAY", required, 1);
+    char layered[2800];
+    setenv("DM_ROMFS_OVERLAY", overlay_variant(required, layered, sizeof layered) ? layered : required, 1);
     if (!lifecycle_ready()) return -8;
     pthread_attr_t a; pthread_attr_init(&a); pthread_attr_setstacksize(&a, 8u << 20);
     pthread_t th; int rc = pthread_create(&th, &a, host_thread, NULL); pthread_attr_destroy(&a);
